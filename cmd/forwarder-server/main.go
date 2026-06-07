@@ -15,10 +15,12 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Wnt/stream-connect/lab/forwarder/internal/server"
@@ -42,11 +44,26 @@ func main() {
 			"dials (e.g. tunnel.lab.madekivi.fi)")
 	}
 
+	// Raw TCP passthrough (Phase 2) — OFF unless FORWARDER_TCP_PORT_RANGE is set
+	// (e.g. "10000-10999"). It binds real public ports, so the operator must also
+	// open the range in the host firewall (redeploy.sh does this from the same var).
+	tcpMin, tcpMax, err := parsePortRange(os.Getenv("FORWARDER_TCP_PORT_RANGE"))
+	if err != nil {
+		log.Fatalf("FORWARDER_TCP_PORT_RANGE: %v", err)
+	}
+	if tcpMax > 0 {
+		log.Printf("tcp tunnels ENABLED on %s ports %d-%d", env("FORWARDER_TCP_BIND", "0.0.0.0"), tcpMin, tcpMax)
+	}
+
 	s := server.New(server.Config{
 		ControlPath:       env("FORWARDER_CONTROL_PATH", "/__forwarder/v1/control"),
 		ControlHost:       controlHost,
 		AgentToken:        os.Getenv("FORWARDER_AGENT_TOKEN"),
 		MaxConnsPerTunnel: envInt("FORWARDER_MAX_CONNS_PER_TUNNEL", 256),
+		TCPMinPort:        tcpMin,
+		TCPMaxPort:        tcpMax,
+		TCPBind:           env("FORWARDER_TCP_BIND", "0.0.0.0"),
+		PublicHost:        os.Getenv("FORWARDER_PUBLIC_HOST"),
 	}, log.Printf)
 
 	// Management API — loopback only. Caddy's ask hits /ask; ops read /status.
@@ -74,6 +91,28 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parsePortRange parses "" (disabled -> 0,0), "PORT", or "MIN-MAX".
+func parsePortRange(s string) (min, max int, err error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, nil
+	}
+	lo, hi, found := strings.Cut(s, "-")
+	min, err = strconv.Atoi(strings.TrimSpace(lo))
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad range %q", s)
+	}
+	if !found {
+		max = min
+	} else if max, err = strconv.Atoi(strings.TrimSpace(hi)); err != nil {
+		return 0, 0, fmt.Errorf("bad range %q", s)
+	}
+	if min <= 0 || max < min {
+		return 0, 0, fmt.Errorf("invalid range %q", s)
+	}
+	return min, max, nil
 }
 
 func envInt(key string, def int) int {

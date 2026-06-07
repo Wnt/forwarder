@@ -92,15 +92,21 @@ func (s *Server) serveAgent(sess *yamux.Session, peer string) {
 	if err := framing.ReadJSONLine(br, &reg); err != nil {
 		return
 	}
-	assigned := s.reg.register(as, reg.Tunnels, s.cfg.MaxConnsPerTunnel)
+	assigned, tcpListeners := s.reg.register(as, reg.Tunnels, s.cfg.MaxConnsPerTunnel, s.cfg.tcpPolicy())
 	_ = framing.WriteJSONLine(ctl, framing.RegisteredMsg{Type: framing.TypeRegistered, Tunnels: assigned})
 	defer s.reg.removeAgent(as.id)
+
+	// Accept loops for the public TCP listeners opened during register. They exit
+	// when removeAgent closes the listeners on disconnect.
+	for _, tl := range tcpListeners {
+		go s.acceptTCP(as, tl)
+	}
 
 	for _, t := range assigned {
 		if t.Error != "" {
 			s.log("agent %s tunnel %q rejected: %s", as.id, t.ID, t.Error)
 		} else {
-			s.log("agent %s tunnel %q -> https://%s", as.id, t.ID, strings.TrimSuffix(t.RemoteAddr, ":443"))
+			s.log("agent %s tunnel %q -> %s", as.id, t.ID, t.RemoteAddr)
 		}
 	}
 	s.log("agent %s registered (%d tunnels) from %s", as.id, len(assigned), peer)
@@ -203,6 +209,41 @@ func proxyWS(w http.ResponseWriter, r *http.Request, st *yamux.Stream) {
 	// bufrw.Reader for the client->agent direction: Hijack may have buffered
 	// bytes past the request that a raw client.Read would miss.
 	pipe(st, client, bufrw.Reader)
+}
+
+// acceptTCP serves one public TCP tunnel listener: every accepted connection is
+// spliced to the agent over a fresh yamux stream. Returns when the listener is
+// closed (removeAgent on disconnect).
+func (s *Server) acceptTCP(as *agentSession, tl *tcpListener) {
+	s.log("agent %s tcp tunnel %q listening on %s", as.id, tl.tunnelID, tl.ln.Addr())
+	for {
+		c, err := tl.ln.Accept()
+		if err != nil {
+			return
+		}
+		go s.proxyTCP(as, c, tl.tunnelID)
+	}
+}
+
+// proxyTCP relays one raw TCP connection to the agent. Unlike HTTP/WS there is no
+// header to parse: write the ConnectHeader, then splice bytes both ways.
+func (s *Server) proxyTCP(as *agentSession, client net.Conn, tunnelID string) {
+	defer client.Close()
+	release, ok := as.acquire()
+	if !ok {
+		return
+	}
+	defer release()
+	st, err := as.sess.OpenStream()
+	if err != nil {
+		return
+	}
+	defer st.Close()
+	hdr := framing.ConnectHeader{TunnelID: tunnelID, RemoteAddr: client.RemoteAddr().String()}
+	if err := framing.WriteJSONLine(st, hdr); err != nil {
+		return
+	}
+	pipe(st, client, client)
 }
 
 // handleAsk backs Caddy's on_demand_tls { ask ... }. Caddy issues a cert for an

@@ -1,9 +1,12 @@
 package server
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/Wnt/stream-connect/lab/forwarder/internal/framing"
 )
@@ -26,11 +29,11 @@ func TestCanonHost(t *testing.T) {
 func TestRegisterConflictAndRemove(t *testing.T) {
 	r := newRegistry()
 	a1 := &agentSession{id: "a1"}
-	got := r.register(a1, []framing.TunnelDef{
+	got, _ := r.register(a1, []framing.TunnelDef{
 		{ID: "web", Proto: framing.ProtoHTTP, Hostname: "ios.test", LocalPort: 8080},
 		{ID: "bad", Proto: framing.ProtoHTTP, Hostname: "", LocalPort: 8080},
 		{ID: "tcp", Proto: framing.ProtoTCP, RemotePort: 2222, LocalPort: 22},
-	}, 8)
+	}, 8, tcpPolicy{})
 	if got[0].Error != "" || got[0].RemoteAddr != "ios.test:443" {
 		t.Fatalf("web tunnel: %+v", got[0])
 	}
@@ -38,7 +41,7 @@ func TestRegisterConflictAndRemove(t *testing.T) {
 		t.Fatalf("missing hostname should be rejected")
 	}
 	if got[2].Error == "" {
-		t.Fatalf("tcp should be rejected in Phase 1")
+		t.Fatalf("tcp should be rejected when disabled")
 	}
 	if !r.hostRegistered("ios.test") {
 		t.Fatalf("ios.test should be registered")
@@ -46,7 +49,7 @@ func TestRegisterConflictAndRemove(t *testing.T) {
 
 	// A second agent cannot steal the hostname.
 	a2 := &agentSession{id: "a2"}
-	got2 := r.register(a2, []framing.TunnelDef{{ID: "web", Proto: framing.ProtoHTTP, Hostname: "ios.test", LocalPort: 9090}}, 8)
+	got2, _ := r.register(a2, []framing.TunnelDef{{ID: "web", Proto: framing.ProtoHTTP, Hostname: "ios.test", LocalPort: 9090}}, 8, tcpPolicy{})
 	if got2[0].Error == "" {
 		t.Fatalf("duplicate hostname should be rejected")
 	}
@@ -57,6 +60,59 @@ func TestRegisterConflictAndRemove(t *testing.T) {
 		t.Fatalf("ios.test should be free after removeAgent")
 	}
 	r.removeAgent("nope")
+}
+
+func TestRegisterTCP(t *testing.T) {
+	port := freePort(t)
+	tp := tcpPolicy{enabled: true, min: port, max: port, bind: "127.0.0.1"}
+	r := newRegistry()
+	a := &agentSession{id: "a"}
+	got, toStart := r.register(a, []framing.TunnelDef{
+		{ID: "ssh", Proto: framing.ProtoTCP, RemotePort: port, LocalPort: 22},
+		{ID: "oor", Proto: framing.ProtoTCP, RemotePort: port + 1, LocalPort: 22},
+	}, 8, tp)
+	if got[0].Error != "" {
+		t.Fatalf("in-range tcp tunnel rejected: %+v", got[0])
+	}
+	if got[1].Error == "" {
+		t.Fatalf("out-of-range port should be rejected")
+	}
+	if len(toStart) != 1 || toStart[0].port != port {
+		t.Fatalf("expected one listener on %d, got %+v", port, toStart)
+	}
+	// The listener is actually bound (a dial completes the TCP handshake).
+	c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
+	if err != nil {
+		t.Fatalf("listener not bound: %v", err)
+	}
+	c.Close()
+
+	// A second agent cannot steal the port.
+	got2, _ := r.register(&agentSession{id: "b"}, []framing.TunnelDef{
+		{ID: "ssh", Proto: framing.ProtoTCP, RemotePort: port, LocalPort: 22},
+	}, 8, tp)
+	if got2[0].Error == "" {
+		t.Fatalf("duplicate port should be rejected")
+	}
+
+	// removeAgent closes the listener, freeing the port.
+	r.removeAgent("a")
+	r.removeAgent("b")
+	ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		t.Fatalf("port not freed after removeAgent: %v", err)
+	}
+	ln.Close()
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
 }
 
 func TestAcquireLimit(t *testing.T) {
@@ -76,7 +132,7 @@ func TestAcquireLimit(t *testing.T) {
 func TestAskHandler(t *testing.T) {
 	s := New(Config{AgentToken: "x", ControlHost: "tunnel.test"}, nil)
 	a := &agentSession{id: "a"}
-	s.reg.register(a, []framing.TunnelDef{{ID: "web", Proto: framing.ProtoHTTP, Hostname: "ios.test", LocalPort: 1}}, 8)
+	s.reg.register(a, []framing.TunnelDef{{ID: "web", Proto: framing.ProtoHTTP, Hostname: "ios.test", LocalPort: 1}}, 8, tcpPolicy{})
 
 	for _, tc := range []struct {
 		domain string

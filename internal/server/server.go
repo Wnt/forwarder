@@ -20,6 +20,26 @@ type Config struct {
 	ControlHost       string // always cert-approved so the agent can dial in
 	AgentToken        string // shared bearer secret (required)
 	MaxConnsPerTunnel int    // per-agent concurrent public connection cap
+
+	// Raw TCP passthrough (Phase 2). OFF unless TCPMaxPort > 0. TCP tunnels need a
+	// real public listen port (they can't ride Caddy's HTTP front door), so this
+	// is opt-in: an operator sets a port range and opens it in the host firewall.
+	// A tcp tunnel's remote_port must fall in [TCPMinPort, TCPMaxPort].
+	TCPMinPort int
+	TCPMaxPort int
+	TCPBind    string // interface TCP tunnel listeners bind (default 0.0.0.0)
+	PublicHost string // optional pretty host for the assigned TCP RemoteAddr label
+}
+
+// tcpPolicy is the registry's view of the TCP config.
+func (c Config) tcpPolicy() tcpPolicy {
+	return tcpPolicy{
+		enabled: c.TCPMaxPort > 0,
+		min:     c.TCPMinPort,
+		max:     c.TCPMaxPort,
+		bind:    c.TCPBind,
+		label:   c.PublicHost,
+	}
 }
 
 // Server is safe for concurrent use once constructed.
@@ -37,6 +57,9 @@ func New(cfg Config, logf func(string, ...any)) *Server {
 	}
 	if cfg.MaxConnsPerTunnel <= 0 {
 		cfg.MaxConnsPerTunnel = 256
+	}
+	if cfg.TCPBind == "" {
+		cfg.TCPBind = "0.0.0.0"
 	}
 	cfg.ControlHost = canonHost(cfg.ControlHost)
 	if logf == nil {

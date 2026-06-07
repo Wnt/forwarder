@@ -50,7 +50,7 @@ cmd/forwarder-agent/    thin main: flags/env + the reconnect loop
 internal/framing/       wire protocol: control messages + connect header + yamux cfg
 internal/server/        registry, control handshake, HTTP/WS proxy, /ask guard
 internal/agent/         dial → auth → register → forward data streams
-internal/e2e/           full server↔agent test (HTTP + 256 KB binary WS frame)
+internal/e2e/           full server↔agent test (HTTP + 256 KB binary WS frame + raw TCP)
 vendor/                 yamux + coder/websocket, vendored for a hermetic box build
 ```
 
@@ -95,6 +95,9 @@ Server config (env, all optional except the token — defaults in parentheses):
 | `FORWARDER_MGMT_PORT` | `7001` | loopback `/ask` + `/status` + `/healthz` |
 | `FORWARDER_CONTROL_PATH` | `/__forwarder/v1/control` | reserved control-WS path |
 | `FORWARDER_MAX_CONNS_PER_TUNNEL` | `256` | per-agent concurrent public connections |
+| `FORWARDER_TCP_PORT_RANGE` | *(unset = off)* | enable raw TCP tunnels on this port range, e.g. `10000-10999` (see Raw TCP below) |
+| `FORWARDER_TCP_BIND` | `0.0.0.0` | interface TCP tunnel listeners bind |
+| `FORWARDER_PUBLIC_HOST` | *(unset)* | pretty host shown in a TCP tunnel's assigned address |
 
 ## Agent (next to your app) — e.g. the iOS-pwa-runner
 
@@ -111,8 +114,11 @@ forwarder-agent \
 
 - `--server` accepts a full `ws(s)://` URL **or** a bare host (then it defaults to
   `wss://<host>/__forwarder/v1/control`).
-- `--tunnel id:http:hostname:localport`, comma-separated for several. The
-  `hostname` must be a `*.lab.madekivi.fi` subdomain (already pointed at the box).
+- `--tunnel`, comma-separated for several:
+  - HTTP/WS: `id:http:hostname:localport` — `hostname` is a `*.lab.madekivi.fi`
+    subdomain (already pointed at the box).
+  - raw TCP: `id:tcp:remoteport:localport` — needs TCP tunnels enabled on the
+    server (see below); `remoteport` must fall in the server's allowed range.
 - It dials **out**, so no inbound ports/port-forwarding on the guest. It
   reconnects automatically (exponential backoff, 60 s cap, jitter).
 
@@ -135,24 +141,57 @@ passkeys. Never run the app with `RPID=localhost` behind the tunnel.)
   *live* agent registered. The HTTP router independently `502`s unknown Hosts.
 - **Token auth.** Agents authenticate with `FORWARDER_AGENT_TOKEN`
   (constant-time compared); repeated failures from an IP trip a short ban.
-- **Loopback + sandboxed.** The server binds only `127.0.0.1`; its systemd unit
-  pins sockets to loopback (`IPAddressAllow=localhost`) and runs read-only with
-  no home/devices — the same backstop the rest of the lab uses.
+- **Loopback + sandboxed.** The HTTP/control/mgmt listeners bind only `127.0.0.1`;
+  the systemd unit pins sockets to loopback (`IPAddressAllow=localhost`) and runs
+  read-only with no home/devices — the same backstop the rest of the lab uses.
+  Enabling raw TCP tunnels lifts the loopback pin (those ports are public by
+  nature); nftables then bounds exposure to the configured range.
 - **The app's own auth is unchanged.** The forwarder is a transparent relay; it
   adds no auth layer. Keep the app's passkey login on.
 
 ## Status / debugging
 
-On the box: `curl -s 127.0.0.1:7001/status` (connected agents + registered hosts),
-`curl -s 127.0.0.1:7001/healthz`, `journalctl -u forwarder -f`. From a guest,
-`forwarder-agent` logs the public URL each tunnel went live at.
+On the box: `curl -s 127.0.0.1:7001/status` (connected agents, registered hosts +
+TCP ports), `curl -s 127.0.0.1:7001/healthz`, `journalctl -u forwarder -f`. From a
+guest, `forwarder-agent` logs the public address each tunnel went live at.
 
-## Phase 2 / 3 (not enabled)
+## Raw TCP tunnels (Phase 2) — opt-in
 
-- **Raw TCP tunnels** (`proto:"tcp"`): the protocol carries them, but they can't
-  ride Caddy's HTTP front door, so they'd need a dedicated listen port + an
-  nftables hole — out of scope for "reuse the box, no new firewall surface". The
-  server currently rejects `tcp` tunnels with a clear per-tunnel error.
-- **WebRTC / coturn**: a guest that wants H.264-over-WebRTC (not the default
-  JPEG-over-WS) would run coturn; that's guest-side and independent of this
-  tunnel. Not deployed here.
+HTTP/WS tunnels ride Caddy on `:443`; raw TCP (e.g. `ssh` to a guest, a game
+server, anything non-HTTP) can't, so it needs a **real public port** on the box.
+That's a deliberate firewall-surface change, so it's **off by default** and gated
+on one env var.
+
+To enable, set a port range on the box (`/etc/lab-control/lab-control.env`):
+
+```
+FORWARDER_TCP_PORT_RANGE=10000-10999      # the only knob; redeploy does the rest
+```
+
+On the next redeploy this:
+- opens that TCP range in nftables (and **only** that range — a malformed value
+  opens nothing),
+- installs a systemd drop-in that lifts the forwarder's loopback IP pin (so it can
+  accept public connections; nftables remains the boundary),
+- makes the server accept `tcp` tunnels whose `remote_port` falls in the range.
+
+Then a guest registers one:
+
+```bash
+forwarder-agent --server tunnel.lab.madekivi.fi --token "$TOK" \
+  --tunnel ssh:tcp:10022:22        # public <box>:10022  →  guest 127.0.0.1:22
+```
+
+The forwarder opens `0.0.0.0:10022`, and every connection is spliced over the same
+yamux session to the agent, which dials `127.0.0.1:22`. Ports are first-come: a
+second agent requesting a bound port is rejected in its `RegisteredMsg`.
+
+> Raw TCP carries no per-tunnel auth of its own — whatever you expose is as
+> reachable as the app behind it. Keep the range tight and expose only services
+> that authenticate (sshd, etc.).
+
+## Phase 3: WebRTC / coturn (not here)
+
+A guest that wants H.264-over-WebRTC instead of the default JPEG-over-WS would run
+coturn alongside its app; that's guest-side and independent of this tunnel, so
+it's intentionally out of scope for the forwarder.

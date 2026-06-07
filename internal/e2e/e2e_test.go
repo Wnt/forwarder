@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,11 @@ const (
 	token   = "test-secret"
 	pubHost = "ios.test"
 )
+
+// discard is the logger handed to the server/agent: their goroutines outlive the
+// test body (teardown is async), so logging via t.Logf from them would race the
+// test's completion. Assertions don't need the logs; t.Fatalf carries failures.
+func discard(string, ...any) {}
 
 // backend stands in for the guest app on localhost: a /hello HTTP route and a
 // /ws echo route that imposes no payload limit.
@@ -76,7 +82,7 @@ func TestEndToEnd(t *testing.T) {
 	backendPort := mustPort(t, backend.URL)
 
 	// Forwarder: ingress handler (what Caddy proxies to) + management handler.
-	s := server.New(server.Config{AgentToken: token, ControlHost: "tunnel.test"}, t.Logf)
+	s := server.New(server.Config{AgentToken: token, ControlHost: "tunnel.test"}, discard)
 	ingress := httptest.NewServer(s.Handler())
 	t.Cleanup(ingress.Close)
 	mgmt := httptest.NewServer(s.ManagementHandler())
@@ -91,7 +97,7 @@ func TestEndToEnd(t *testing.T) {
 		ServerURL: agent.ControlURL("ws://" + ingressAddr + "/__forwarder/v1/control"),
 		Token:     token,
 		Tunnels:   []framing.TunnelDef{{ID: "web", Proto: framing.ProtoHTTP, Hostname: pubHost, LocalPort: backendPort}},
-		Logf:      t.Logf,
+		Logf:      discard,
 	})
 
 	waitRegistered(t, mgmt.URL, pubHost)
@@ -169,8 +175,89 @@ func TestEndToEnd(t *testing.T) {
 	})
 }
 
+// TestEndToEndTCP exercises the raw TCP passthrough path: the server opens a
+// public TCP listener for a registered tcp tunnel, and a raw client connection to
+// it round-trips through the agent to a local TCP echo server.
+func TestEndToEndTCP(t *testing.T) {
+	// Local TCP echo backend (stands in for, e.g., sshd on the guest).
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { echo.Close() })
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(c, c); c.Close() }()
+		}
+	}()
+	echoPort := echo.Addr().(*net.TCPAddr).Port
+
+	// The public TCP listen port — bound on loopback for the test. Pick a free one
+	// and pin the policy range to exactly it.
+	pubPort := freeTCPPort(t)
+	s := server.New(server.Config{
+		AgentToken: token, ControlHost: "tunnel.test",
+		TCPMinPort: pubPort, TCPMaxPort: pubPort, TCPBind: "127.0.0.1",
+	}, discard)
+	ingress := httptest.NewServer(s.Handler())
+	t.Cleanup(ingress.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go agent.Run(ctx, agent.Config{
+		ServerURL: agent.ControlURL("ws://" + mustHost(t, ingress.URL) + "/__forwarder/v1/control"),
+		Token:     token,
+		Tunnels:   []framing.TunnelDef{{ID: "echo", Proto: framing.ProtoTCP, RemotePort: pubPort, LocalPort: echoPort}},
+		Logf:      discard,
+	})
+
+	// Wait for the public listener to come up (it's opened on registration), then
+	// round-trip raw bytes through it.
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(pubPort))
+	var conn net.Conn
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+			conn = c
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if conn == nil {
+		t.Fatal("public tcp port never opened")
+	}
+	defer conn.Close()
+
+	msg := []byte("hello over a raw tcp tunnel")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, len(msg))
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(buf) != string(msg) {
+		t.Fatalf("echo = %q, want %q", buf, msg)
+	}
+}
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
 func TestAuthRejected(t *testing.T) {
-	s := server.New(server.Config{AgentToken: token, ControlHost: "tunnel.test"}, t.Logf)
+	s := server.New(server.Config{AgentToken: token, ControlHost: "tunnel.test"}, discard)
 	ingress := httptest.NewServer(s.Handler())
 	t.Cleanup(ingress.Close)
 

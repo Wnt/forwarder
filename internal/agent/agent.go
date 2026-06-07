@@ -187,7 +187,10 @@ func handleDataStream(cfg Config, ports map[string]int, st *yamux.Stream) {
 	stop()
 }
 
-// ParseTunnels parses comma-separated specs. HTTP form: id:http:hostname:localport.
+// ParseTunnels parses comma-separated tunnel specs:
+//
+//	id:http:hostname:localport     e.g. web:http:ios.lab.madekivi.fi:8080
+//	id:tcp:remoteport:localport    e.g. ssh:tcp:10022:22
 func ParseTunnels(spec string) ([]framing.TunnelDef, error) {
 	var out []framing.TunnelDef
 	for _, raw := range strings.Split(spec, ",") {
@@ -196,18 +199,28 @@ func ParseTunnels(spec string) ([]framing.TunnelDef, error) {
 			continue
 		}
 		parts := strings.Split(raw, ":")
-		if len(parts) < 4 {
-			return nil, fmt.Errorf("%q: want id:proto:hostname:localport", raw)
-		}
-		proto := parts[1]
-		if proto != framing.ProtoHTTP {
-			return nil, fmt.Errorf("%q: only proto %q is supported", raw, framing.ProtoHTTP)
+		if len(parts) != 4 {
+			return nil, fmt.Errorf("%q: want id:proto:hostname-or-remoteport:localport", raw)
 		}
 		lp, err := strconv.Atoi(parts[3])
 		if err != nil {
 			return nil, fmt.Errorf("%q: bad local port %q", raw, parts[3])
 		}
-		out = append(out, framing.TunnelDef{ID: parts[0], Proto: proto, Hostname: parts[2], LocalPort: lp})
+		switch parts[1] {
+		case framing.ProtoHTTP:
+			if parts[2] == "" {
+				return nil, fmt.Errorf("%q: http tunnel needs a hostname", raw)
+			}
+			out = append(out, framing.TunnelDef{ID: parts[0], Proto: framing.ProtoHTTP, Hostname: parts[2], LocalPort: lp})
+		case framing.ProtoTCP:
+			rp, err := strconv.Atoi(parts[2])
+			if err != nil {
+				return nil, fmt.Errorf("%q: bad remote port %q", raw, parts[2])
+			}
+			out = append(out, framing.TunnelDef{ID: parts[0], Proto: framing.ProtoTCP, RemotePort: rp, LocalPort: lp})
+		default:
+			return nil, fmt.Errorf("%q: unknown proto %q (want http or tcp)", raw, parts[1])
+		}
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no tunnels parsed")

@@ -1,20 +1,34 @@
 package agent
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Wnt/stream-connect/lab/forwarder/internal/framing"
+)
 
 func TestParseTunnels(t *testing.T) {
-	defs, err := ParseTunnels("web:http:ios.lab.madekivi.fi:8080, api:http:api.lab.madekivi.fi:9090")
+	defs, err := ParseTunnels("web:http:ios.lab.madekivi.fi:8080, ssh:tcp:10022:22")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	if len(defs) != 2 {
 		t.Fatalf("got %d tunnels", len(defs))
 	}
-	if defs[0].ID != "web" || defs[0].Hostname != "ios.lab.madekivi.fi" || defs[0].LocalPort != 8080 {
+	if defs[0].ID != "web" || defs[0].Proto != framing.ProtoHTTP || defs[0].Hostname != "ios.lab.madekivi.fi" || defs[0].LocalPort != 8080 {
 		t.Fatalf("tunnel[0] = %+v", defs[0])
 	}
+	if defs[1].ID != "ssh" || defs[1].Proto != framing.ProtoTCP || defs[1].RemotePort != 10022 || defs[1].LocalPort != 22 {
+		t.Fatalf("tunnel[1] = %+v", defs[1])
+	}
 
-	for _, bad := range []string{"", "web:http:host", "web:tcp:2222:22", "web:http:host:notaport"} {
+	for _, bad := range []string{
+		"",              // empty
+		"web:http:host", // too few fields
+		"web:http:host:notaport",
+		"x:bogus:host:1",    // unknown proto
+		"x:tcp:notaport:22", // bad remote port
+		"x:http::8080",      // http needs hostname
+	} {
 		if _, err := ParseTunnels(bad); err == nil {
 			t.Errorf("ParseTunnels(%q) should error", bad)
 		}
