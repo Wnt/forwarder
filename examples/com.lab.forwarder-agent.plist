@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS LaunchAgent for the forwarder agent (guest side, e.g. the iOS-pwa-runner
+  Mac). Install to ~/Library/LaunchAgents/com.lab.forwarder-agent.plist, edit the
+  paths/host/token/tunnel, then:
+      launchctl load -w ~/Library/LaunchAgents/com.lab.forwarder-agent.plist
+  KeepAlive restarts it if it exits; the agent's own backoff handles box restarts.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lab.forwarder-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/forwarder-agent</string>
+    <string>--server</string>
+    <string>wss://tunnel.lab.madekivi.fi/__forwarder/v1/control</string>
+    <string>--token</string>
+    <string>REPLACE_WITH_FORWARDER_AGENT_TOKEN</string>
+    <string>--tunnel</string>
+    <string>web:http:ios.lab.madekivi.fi:8080</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/forwarder-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/forwarder-agent.log</string>
+</dict>
+</plist>

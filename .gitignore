@@ -1,0 +1,2 @@
+# Built binaries — produced by `make` / redeploy on the box, never committed.
+/bin/
