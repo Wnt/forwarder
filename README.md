@@ -27,6 +27,13 @@ the agent at any local HTTP/WebSocket port and a `*.lab.madekivi.fi` subdomain.
  └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+> **Live deployment (`vm-control`).** The forwarder is deployed and running on the
+> lab box (public IP behind `*.lab.madekivi.fi`). **Raw TCP tunnels are enabled**
+> with range **`10000-19999`**. Agents dial control host
+> **`tunnel.lab.madekivi.fi`**; the shared token is on the box at
+> `/etc/lab-control/lab-control.env` (`FORWARDER_AGENT_TOKEN`). HTTP/WS guests pick
+> any `*.lab.madekivi.fi` subdomain (e.g. `ios.lab.madekivi.fi`).
+
 ## Why this shape (and where it diverges from the original spec)
 
 The engineering spec proposed a standalone VPS where the forwarder owns `:443` +
@@ -56,17 +63,33 @@ vendor/                 yamux + coder/websocket, vendored for a hermetic box bui
 
 Two small deps: `github.com/hashicorp/yamux`, `github.com/coder/websocket`.
 
-## Build & test
+## Get the binaries (download or build)
+
+You need `forwarder-server` (Linux, runs on the box) and `forwarder-agent`
+(macOS/Linux, runs next to your app).
+
+**Download from CI — no Go required.** Every push/PR builds them and uploads a
+`forwarder-binaries` artifact (server + agent for `darwin-arm64`, `darwin-amd64`,
+`linux-amd64`). Pull the latest green `main` build with the GitHub CLI:
+
+```bash
+gh run download --repo Wnt/stream-connect -n forwarder-binaries --dir bin \
+  "$(gh run list --repo Wnt/stream-connect --workflow Lab --branch main \
+       --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+chmod +x bin/forwarder-agent-*        # artifacts arrive without the exec bit
+```
+
+(Or: GitHub → Actions → a green **Lab** run → Artifacts → `forwarder-binaries`.)
+
+**Build from source** — needs Go ≥ 1.23; hermetic (vendored deps, no network
+fetch), exactly how `vm-control` rebuilds the server during redeploy:
 
 ```bash
 cd lab/forwarder
-make test          # go vet + unit + end-to-end tests (race-clean)
-make server        # bin/forwarder-server          (linux/amd64 — what the box runs)
-make agents        # bin/forwarder-agent-{darwin-arm64,darwin-amd64,linux-amd64}
+make all       # bin/forwarder-server + bin/forwarder-agent-{darwin-arm64,darwin-amd64,linux-amd64}
+make agents    # just the agents      (make server = just the linux server)
+make test      # go vet + unit + end-to-end tests (race-clean)
 ```
-
-The build is hermetic — `GOTOOLCHAIN=local` + vendored deps, so it fetches
-nothing. That's exactly how `vm-control` rebuilds the server during redeploy.
 
 ## Server (on the lab box) — fully automated
 
@@ -95,7 +118,7 @@ Server config (env, all optional except the token — defaults in parentheses):
 | `FORWARDER_MGMT_PORT` | `7001` | loopback `/ask` + `/status` + `/healthz` |
 | `FORWARDER_CONTROL_PATH` | `/__forwarder/v1/control` | reserved control-WS path |
 | `FORWARDER_MAX_CONNS_PER_TUNNEL` | `256` | per-agent concurrent public connections |
-| `FORWARDER_TCP_PORT_RANGE` | *(unset = off)* | enable raw TCP tunnels on this port range, e.g. `10000-10999` (see Raw TCP below) |
+| `FORWARDER_TCP_PORT_RANGE` | *(unset = off)* | enable raw TCP tunnels on this port range, e.g. `10000-19999` (live on the box; see Raw TCP below) |
 | `FORWARDER_TCP_BIND` | `0.0.0.0` | interface TCP tunnel listeners bind |
 | `FORWARDER_PUBLIC_HOST` | *(unset)* | pretty host shown in a TCP tunnel's assigned address |
 
@@ -121,6 +144,33 @@ forwarder-agent \
     server (see below); `remoteport` must fall in the server's allowed range.
 - It dials **out**, so no inbound ports/port-forwarding on the guest. It
   reconnects automatically (exponential backoff, 60 s cap, jitter).
+
+### `forwarder-agent` — CLI reference
+
+Every flag has an env fallback, so it drops into a `.env`-driven launcher (see
+[`examples/`](examples/)). All three of server/token/tunnel are required.
+
+| Flag | Env fallback | Meaning |
+|---|---|---|
+| `--server <url\|host>` | `FORWARDER_SERVER` | Control endpoint: a full `ws(s)://…/__forwarder/v1/control` URL, or a bare host (expands to `wss://<host>/__forwarder/v1/control`). |
+| `--token <secret>` | `FORWARDER_AGENT_TOKEN` | Shared bearer secret; must equal the server's. |
+| `--tunnel <spec>[,<spec>…]` | `FORWARDER_TUNNELS` | One or more tunnels (grammar below). |
+| `--insecure` | — | Skip TLS verification of the server (dev only). |
+
+Tunnel spec grammar (colon-separated, comma-joined for several):
+
+| Form | Example | Result |
+|---|---|---|
+| `id:http:hostname:localport` | `web:http:ios.lab.madekivi.fi:8080` | HTTP/WS, routed by `hostname` over `:443`; → `127.0.0.1:8080`. |
+| `id:tcp:remoteport:localport` | `ssh:tcp:10022:22` | Raw TCP; server listens on public `remoteport` (must be in its range) → `127.0.0.1:22`. |
+
+Behavior: dials **out** only (NAT-friendly); after auth it registers the tunnels
+and logs the public address of each; forwards every pushed connection to
+`127.0.0.1:localport`; auto-reconnects (exp backoff, 60 s cap, jitter); shuts down
+on `SIGINT`/`SIGTERM`. It exits non-zero only on bad flags — a rejected tunnel is
+reported per-tunnel in the logs, not fatal. Server-side knobs (the box) are the
+`FORWARDER_*` env table above; the on-the-wire control protocol is defined in
+[`internal/framing/framing.go`](internal/framing/framing.go).
 
 The app itself is unchanged and unaware of the tunnel. For the iOS-pwa-runner
 specifically, set in **its** `.env` so passkeys bind to the public origin:
@@ -160,12 +210,13 @@ guest, `forwarder-agent` logs the public address each tunnel went live at.
 HTTP/WS tunnels ride Caddy on `:443`; raw TCP (e.g. `ssh` to a guest, a game
 server, anything non-HTTP) can't, so it needs a **real public port** on the box.
 That's a deliberate firewall-surface change, so it's **off by default** and gated
-on one env var.
+on one env var. **It is already enabled on `vm-control` (`10000-19999`)** — this
+section is how it was turned on / how to change it.
 
 To enable, set a port range on the box (`/etc/lab-control/lab-control.env`):
 
 ```
-FORWARDER_TCP_PORT_RANGE=10000-10999      # the only knob; redeploy does the rest
+FORWARDER_TCP_PORT_RANGE=10000-19999      # the only knob; redeploy does the rest
 ```
 
 On the next redeploy this:

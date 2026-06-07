@@ -45,7 +45,7 @@ func main() {
 	}
 
 	// Raw TCP passthrough (Phase 2) — OFF unless FORWARDER_TCP_PORT_RANGE is set
-	// (e.g. "10000-10999"). It binds real public ports, so the operator must also
+	// (e.g. "10000-19999"). It binds real public ports, so the operator must also
 	// open the range in the host firewall (redeploy.sh does this from the same var).
 	tcpMin, tcpMax, err := parsePortRange(os.Getenv("FORWARDER_TCP_PORT_RANGE"))
 	if err != nil {
