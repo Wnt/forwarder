@@ -258,3 +258,10 @@ second agent requesting a bound port is rejected in its `RegisteredMsg`.
 A guest that wants H.264-over-WebRTC instead of the default JPEG-over-WS would run
 coturn alongside its app; that's guest-side and independent of this tunnel, so
 it's intentionally out of scope for the forwarder.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+The two vendored dependencies are compatible: `hashicorp/yamux` is MPL-2.0
+(file-level copyleft, no obligation on this code) and `coder/websocket` is ISC.
