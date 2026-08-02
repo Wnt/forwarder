@@ -1,4 +1,9 @@
-# Caddy config for a dedicated forwarder box.
+# Caddy config for a forwarder box.
+#
+# @-placeholders are rendered by deploy/install.sh. With no site tunnel
+# configured they render empty and Caddy owns :80/:443 directly. When
+# SITE_PEER_IP is set, HAProxy takes those ports and Caddy moves to loopback
+# 8080/8443 behind it (see deploy/haproxy.cfg for why the split exists).
 #
 # This file is the WHOLE Caddy config — the box exists to front the forwarder and
 # nothing else. If you are adding the forwarder to a box that already runs other
@@ -23,6 +28,7 @@
 	# No `email` here on purpose: an empty placeholder fails `caddy validate`,
 	# which would block every deploy on a box that never set one. Add
 	# `email you@example.com` by hand if you want Let's Encrypt expiry warnings.
+@CADDY_PORTS@
 }
 
 # Catch-all. Every HTTPS host that resolves here lands on the forwarder, which
@@ -32,6 +38,7 @@
 # reverse_proxy passes WebSocket upgrades through transparently, so streaming
 # guests are never frame-buffered.
 https:// {
+@CADDY_BIND@
 	tls {
 		on_demand
 	}

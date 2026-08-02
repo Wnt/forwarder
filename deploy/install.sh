@@ -115,7 +115,28 @@ cat > /etc/systemd/system/caddy.service.d/forwarder-env.conf <<EOF
 [Service]
 EnvironmentFile=${ENV_FILE}
 EOF
-install -m 644 "$REPO_DIR/deploy/Caddyfile" /etc/caddy/Caddyfile
+
+# With a site tunnel configured, HAProxy owns :80/:443 and Caddy moves behind it
+# on loopback. http_port/https_port are set globally (not just `bind`) so that
+# Caddy's automatic-HTTPS redirects and its ACME http-01 challenge listener move
+# too — otherwise Caddy would keep advertising :80/:443 and its own certificate
+# renewals would fail.
+if [ -n "${SITE_PEER_IP:-}" ]; then
+  CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-8080}"
+  CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-8443}"
+  ports=$(printf '\thttp_port %s\n\thttps_port %s' "$CADDY_HTTP_PORT" "$CADDY_HTTPS_PORT")
+  bind=$'\tbind 127.0.0.1'
+else
+  ports=""; bind=""
+fi
+python3 - "$REPO_DIR/deploy/Caddyfile" "$ports" "$bind" > /etc/caddy/Caddyfile <<'PY'
+import sys
+src, ports, bind = sys.argv[1], sys.argv[2], sys.argv[3]
+out = open(src).read().replace("@CADDY_PORTS@", ports).replace("@CADDY_BIND@", bind)
+# Drop the lines that render empty so the result stays clean.
+sys.stdout.write("\n".join(l for l in out.split("\n") if l.strip() != "" or True))
+PY
+chmod 644 /etc/caddy/Caddyfile
 
 # Validate BEFORE restarting: a bad config must fail the deploy, not take the
 # box's only public listener down. The env has to be present for the
@@ -125,6 +146,47 @@ if ! ( set -a; source "$ENV_FILE"; set +a; caddy validate --config /etc/caddy/Ca
   die "caddy validate failed — not restarting"
 fi
 
+if [ -n "${SITE_PEER_IP:-}" ]; then
+  say "Site tunnel (WireGuard) + HAProxy"
+  dpkg -s haproxy   >/dev/null 2>&1 || apt-get install -y -qq haproxy >/dev/null
+  dpkg -s wireguard-tools >/dev/null 2>&1 || apt-get install -y -qq wireguard-tools >/dev/null
+
+  : "${WG_PORT:=51820}" "${WG_EDGE_ADDR:=10.66.0.1}"
+  [ -n "${WG_EDGE_PRIVKEY:-}" ]  || die "WG_EDGE_PRIVKEY is unset (see deploy/env.example)"
+  [ -n "${WG_PEER_PUBKEY:-}" ]   || die "WG_PEER_PUBKEY is unset"
+  [ -n "${SITE_HOSTS:-}" ]       || die "SITE_HOSTS is unset"
+
+  umask 077
+  sed -e "s|@WG_EDGE_ADDR@|${WG_EDGE_ADDR}|" \
+      -e "s|@WG_PORT@|${WG_PORT}|" \
+      -e "s|@WG_EDGE_PRIVKEY@|${WG_EDGE_PRIVKEY}|" \
+      -e "s|@WG_PEER_PUBKEY@|${WG_PEER_PUBKEY}|" \
+      -e "s|@SITE_PEER_IP@|${SITE_PEER_IP}|" \
+      "$REPO_DIR/deploy/wg0.conf" > /etc/wireguard/wg0.conf
+  chmod 600 /etc/wireguard/wg0.conf
+  umask 022
+
+  sed -e "s|@SITE_HOSTS@|${SITE_HOSTS}|" \
+      -e "s|@SITE_SUFFIX@|${SITE_SUFFIX:-.invalid}|" \
+      -e "s|@SITE_PEER_IP@|${SITE_PEER_IP}|" \
+      -e "s|@K8S_HOST@|${K8S_HOST:-the Kubernetes API host}|" \
+      -e "s|@CADDY_HTTP_PORT@|${CADDY_HTTP_PORT:-8080}|" \
+      -e "s|@CADDY_HTTPS_PORT@|${CADDY_HTTPS_PORT:-8443}|" \
+      "$REPO_DIR/deploy/haproxy.cfg" > /etc/haproxy/haproxy.cfg
+
+  # Validate before restarting: HAProxy owns the box's only public listener, and
+  # a config error would take the tunnel down with it.
+  haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null || die "haproxy config rejected"
+
+  systemctl enable wg-quick@wg0 >/dev/null 2>&1 || true
+  systemctl restart wg-quick@wg0
+  systemctl enable haproxy >/dev/null 2>&1 || true
+else
+  # No site tunnel: make sure a previously-installed HAProxy isn't holding :443.
+  systemctl disable --now haproxy   >/dev/null 2>&1 || true
+  systemctl disable --now wg-quick@wg0 >/dev/null 2>&1 || true
+fi
+
 say "Firewall"
 if [ -n "${FORWARDER_TCP_PORT_RANGE:-}" ]; then
   lo="${FORWARDER_TCP_PORT_RANGE%%-*}"; hi="${FORWARDER_TCP_PORT_RANGE##*-}"
@@ -132,7 +194,13 @@ if [ -n "${FORWARDER_TCP_PORT_RANGE:-}" ]; then
 else
   rule="# raw TCP tunnels disabled (FORWARDER_TCP_PORT_RANGE unset)"
 fi
-sed "s|@FWD_TCP_RULE@|${rule}|" "$REPO_DIR/deploy/nftables.conf" > /etc/nftables.conf
+if [ -n "${SITE_PEER_IP:-}" ]; then
+  wg_rule="udp dport ${WG_PORT:-51820} accept"
+else
+  wg_rule="# site tunnel disabled (SITE_PEER_IP unset)"
+fi
+sed -e "s|@FWD_TCP_RULE@|${rule}|" -e "s|@WG_RULE@|${wg_rule}|" \
+    "$REPO_DIR/deploy/nftables.conf" > /etc/nftables.conf
 chmod 755 /etc/nftables.conf
 nft -c -f /etc/nftables.conf || die "nftables ruleset rejected — not applying"
 systemctl enable --now nftables >/dev/null 2>&1 || true
@@ -143,6 +211,7 @@ systemctl daemon-reload
 systemctl enable forwarder >/dev/null 2>&1 || true
 systemctl restart caddy
 systemctl restart forwarder
+[ -n "${SITE_PEER_IP:-}" ] && systemctl restart haproxy
 
 say "Health gate"
 mgmt="${FORWARDER_MGMT_PORT:-7001}"
