@@ -37,8 +37,9 @@ the agent at any local HTTP/WebSocket port and a subdomain.
  └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-> **Live deployment (`vm-control`).** The forwarder is deployed and running on the
-> lab box (public IP behind `*.lab.madekivi.fi`). **Raw TCP tunnels are enabled**
+> **Live deployment (`vm-control`).** The forwarder runs on the author's box
+> (public IP behind `*.lab.madekivi.fi`), deployed from this repo's `main` by CI.
+> **Raw TCP tunnels are enabled**
 > with range **`10000-19999`**. Agents dial control host
 > **`tunnel.lab.madekivi.fi`**; the shared token is on the box at
 > `/etc/forwarder/forwarder.env` (`FORWARDER_AGENT_TOKEN`). HTTP/WS guests pick
