@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Wnt/stream-connect/lab/forwarder/internal/framing"
+	"github.com/Wnt/forwarder/internal/framing"
 )
 
 func TestCanonHost(t *testing.T) {

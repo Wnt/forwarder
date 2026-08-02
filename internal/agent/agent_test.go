@@ -3,7 +3,7 @@ package agent
 import (
 	"testing"
 
-	"github.com/Wnt/stream-connect/lab/forwarder/internal/framing"
+	"github.com/Wnt/forwarder/internal/framing"
 )
 
 func TestParseTunnels(t *testing.T) {

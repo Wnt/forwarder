@@ -1,4 +1,4 @@
-module github.com/Wnt/stream-connect/lab/forwarder
+module github.com/Wnt/forwarder
 
 // Kept at the lowest Go the box might ship (Debian 13 ships 1.24, the sandbox
 // 1.24.7) so a plain `go build` on the box never tries to download a newer

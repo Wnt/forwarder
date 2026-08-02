@@ -1,0 +1,41 @@
+# The box-side half of the reverse tunnel: NAT'd apps appear on the public
+# internet through this host's Caddy on :443. Source + design: ../../README.md.
+#
+# Loopback-only by default. Caddy reverse-proxies both the agent control
+# WebSocket and all public guest traffic to FORWARDER_HTTP_PORT (7080), and
+# Caddy's on-demand TLS asks FORWARDER_MGMT_PORT (7001) /ask before issuing a
+# cert. So this opens NO new public port.
+[Unit]
+Description=forwarder (reverse-tunnel ingress)
+After=network-online.target caddy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/forwarder/forwarder.env
+ExecStart=/usr/local/bin/forwarder-server
+Restart=always
+RestartSec=3
+
+# It binds only 127.0.0.1 and never writes to disk (logs go to journald), so lock
+# it down hard. IPAddress* pins every socket to loopback, so an accidental
+# non-loopback bind is unreachable from off-box.
+#
+# When raw TCP tunnels are enabled, install.sh drops in a forwarder.service.d
+# override that RESETS these two lists so the public TCP listeners can accept;
+# nftables then bounds the exposure to the configured port range.
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressAllow=localhost
+IPAddressDeny=any
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Wnt/stream-connect/lab/forwarder/internal/framing"
+	"github.com/Wnt/forwarder/internal/framing"
 	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
 )

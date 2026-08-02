@@ -1,0 +1,24 @@
+#cloud-config
+# First-boot user_data for a forwarder box. Deliberately thin: clone the repo and
+# hand off to deploy/install.sh, so provisioning and redeploys run the same code.
+#
+# @-placeholders are rendered by provision-upcloud.sh.
+package_update: true
+packages:
+  - git
+  - curl
+  - ca-certificates
+
+write_files:
+  - path: /etc/forwarder/forwarder.env
+    permissions: '0600'
+    owner: root:root
+    content: |
+      # Seeded by cloud-init. install.sh will not overwrite these.
+      FORWARDER_AGENT_TOKEN=@AGENT_TOKEN@
+      FORWARDER_CONTROL_HOST=@CONTROL_HOST@
+      @EXTRA_ENV@
+
+runcmd:
+  - [ git, clone, --depth, '1', '@REPO_URL@', /opt/forwarder ]
+  - [ bash, /opt/forwarder/deploy/install.sh ]

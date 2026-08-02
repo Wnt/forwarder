@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Wnt/stream-connect/lab/forwarder/internal/agent"
-	"github.com/Wnt/stream-connect/lab/forwarder/internal/framing"
-	"github.com/Wnt/stream-connect/lab/forwarder/internal/server"
+	"github.com/Wnt/forwarder/internal/agent"
+	"github.com/Wnt/forwarder/internal/framing"
+	"github.com/Wnt/forwarder/internal/server"
 	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
 )

@@ -1,19 +1,29 @@
 # Self-hosted forwarder (reverse tunnel)
 
 An **application-agnostic reverse tunnel** that puts apps running behind NAT onto
-the public internet at `*.lab.madekivi.fi`, **reusing the lab box** (`vm-control`)
-and its existing Caddy + Let's Encrypt — no extra VPS, no new firewall port.
+the public internet under a wildcard domain you control, using one small VPS and
+its Caddy + Let's Encrypt — **no inbound port on the app's network**, because the
+agent dials out.
 
-The first guest is the [iOS-pwa-runner](https://github.com/Wnt/iOS-pwa-runner)
+[`deploy/`](deploy/) provisions that VPS from an UpCloud API token and a name:
+
+```bash
+export UPCLOUD_TOKEN=ucat_...
+deploy/provision-upcloud.sh myedge tunnel.example.com
+```
+
+The first guest was the [iOS-pwa-runner](https://github.com/Wnt/iOS-pwa-runner)
 (needed a stable public HTTPS origin for WebAuthn passkeys after Tailscale Funnel
 / ngrok / Cloudflare each hit a wall), but nothing here is runner-specific: point
-the agent at any local HTTP/WebSocket port and a `*.lab.madekivi.fi` subdomain.
+the agent at any local HTTP/WebSocket port and a subdomain.
+
+> Examples below use `*.lab.madekivi.fi`, the author's deployment. Substitute
+> your own wildcard domain throughout.
 
 ```
                  *.lab.madekivi.fi  ──A──►  vm-control public IP
- ┌──────────────────────────────── vm-control (the lab box) ───────────────────┐
+ ┌──────────────────────────────── the box (small public VPS) ─────────────────┐
  │  Caddy :443  (TLS, Let's Encrypt; on-demand per-subdomain, /ask-gated)        │
- │    ├─ {$LAB_HOSTNAME}            → lab console (unchanged)                     │
  │    └─ * (catch-all, on_demand)   → 127.0.0.1:7080  forwarder-server           │
  │                                      ├─ control WS  (agents dial in)          │
  │                                      ├─ public ingress (route by Host)        │
@@ -31,18 +41,18 @@ the agent at any local HTTP/WebSocket port and a `*.lab.madekivi.fi` subdomain.
 > lab box (public IP behind `*.lab.madekivi.fi`). **Raw TCP tunnels are enabled**
 > with range **`10000-19999`**. Agents dial control host
 > **`tunnel.lab.madekivi.fi`**; the shared token is on the box at
-> `/etc/lab-control/lab-control.env` (`FORWARDER_AGENT_TOKEN`). HTTP/WS guests pick
+> `/etc/forwarder/forwarder.env` (`FORWARDER_AGENT_TOKEN`). HTTP/WS guests pick
 > any `*.lab.madekivi.fi` subdomain (e.g. `ios.lab.madekivi.fi`).
 
 ## Why this shape (and where it diverges from the original spec)
 
 The engineering spec proposed a standalone VPS where the forwarder owns `:443` +
 `:7000` and terminates TLS itself with **certmagic**. We deliberately changed two
-things to **reuse the lab box**, which already runs Caddy on `:80/:443`:
+things, so the box can also host unrelated Caddy sites:
 
 | Spec | Here | Why |
 |---|---|---|
-| Forwarder owns `:443`, certmagic issues certs | **Caddy** keeps `:443`; forwarder is loopback-only behind it | Two processes can't own `:443`; Caddy already has a valid LE cert + ACME account. Drops the heavy certmagic dep → the binary builds in seconds on the 1 GB box. |
+| Forwarder owns `:443`, certmagic issues certs | **Caddy** keeps `:443`; forwarder is loopback-only behind it | Two processes can't own `:443`, so this leaves room for other sites on the same box. Caddy already manages LE certs. Drops the heavy certmagic dep → the binary builds in seconds on a 1 GB box. |
 | Agent dials a dedicated TLS `:7000` | Agent dials **wss through Caddy on `:443`** | No new firewall hole (nftables stays `22/80/443`); reuses the LE cert (agent trusts system roots); works through restrictive guest networks. yamux just rides a WebSocket (`coder/websocket` `NetConn`). |
 
 Everything else follows the spec: yamux multiplexing, newline-JSON control
@@ -73,40 +83,41 @@ You need `forwarder-server` (Linux, runs on the box) and `forwarder-agent`
 `linux-amd64`). Pull the latest green `main` build with the GitHub CLI:
 
 ```bash
-gh run download --repo Wnt/stream-connect -n forwarder-binaries --dir bin \
-  "$(gh run list --repo Wnt/stream-connect --workflow Lab --branch main \
+gh run download --repo Wnt/forwarder -n forwarder-binaries --dir bin \
+  "$(gh run list --repo Wnt/forwarder --workflow CI --branch main \
        --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
 chmod +x bin/forwarder-agent-*        # artifacts arrive without the exec bit
 ```
 
-(Or: GitHub → Actions → a green **Lab** run → Artifacts → `forwarder-binaries`.)
+(Or: GitHub → Actions → a green **CI** run → Artifacts → `forwarder-binaries`.)
 
 **Build from source** — needs Go ≥ 1.23; hermetic (vendored deps, no network
-fetch), exactly how `vm-control` rebuilds the server during redeploy:
+fetch), exactly how the box rebuilds the server during redeploy:
 
 ```bash
-cd lab/forwarder
 make all       # bin/forwarder-server + bin/forwarder-agent-{darwin-arm64,darwin-amd64,linux-amd64}
 make agents    # just the agents      (make server = just the linux server)
 make test      # go vet + unit + end-to-end tests (race-clean)
 ```
 
-## Server (on the lab box) — fully automated
+## Server (on the box) — fully automated
 
-You don't deploy this by hand. The forwarder is part of the lab's
-deploy-from-`main` loop:
+You don't deploy this by hand. See [`deploy/README.md`](deploy/README.md) for the
+details; the short version:
 
-- **`deploy/setup.sh`** (one-time provisioning) installs `golang-go` and seeds
-  `FORWARDER_AGENT_TOKEN` (random) + `FORWARDER_CONTROL_HOST` into the env file.
-- **`deploy/redeploy.sh`** (every push to `main`) builds the server from vendored
-  source, installs the `forwarder.service` unit + the Caddy `conf.d/forwarder.caddy`
-  catch-all site, then restarts both. A `caddy validate` gate fails the deploy if
-  the config is bad.
+- **`deploy/provision-upcloud.sh <name> <control-host>`** creates the VPS from an
+  UpCloud token, injecting `cloud-init.yaml` as user_data.
+- **`deploy/install.sh`** (box-side, idempotent) is the single source of truth for
+  "build, install, restart": apt deps + Caddy, build from vendored source, install
+  the unit + Caddyfile + nftables, `caddy validate`, restart, health gate. First
+  boot and every CI deploy both run it, so a fresh box and a long-lived one
+  converge on the same state.
+- **`deploy/redeploy.sh`** is `git reset --hard origin/main` + `install.sh`, and is
+  the forced command the CI deploy key is pinned to.
 
-So: land a change to `lab/forwarder/**` (or `lab/lab-control/deploy/**`) on
-`main`; CI runs `go test`, then SSHes to the box and redeploys. To bring up the
-forwarder on the **existing** live box for the first time, re-run `setup.sh` once
-(it provisions Go + the token); thereafter redeploys are automatic.
+So: land a change on `main`; CI runs `go vet`/`go test`/`make all`, then SSHes to
+the box and redeploys. A deploy that leaves the forwarder unhealthy exits
+non-zero and fails the job.
 
 Server config (env, all optional except the token — defaults in parentheses):
 
@@ -213,7 +224,7 @@ That's a deliberate firewall-surface change, so it's **off by default** and gate
 on one env var. **It is already enabled on `vm-control` (`10000-19999`)** — this
 section is how it was turned on / how to change it.
 
-To enable, set a port range on the box (`/etc/lab-control/lab-control.env`):
+To enable, set a port range on the box (`/etc/forwarder/forwarder.env`):
 
 ```
 FORWARDER_TCP_PORT_RANGE=10000-19999      # the only knob; redeploy does the rest

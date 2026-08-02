@@ -23,7 +23,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Wnt/stream-connect/lab/forwarder/internal/server"
+	"github.com/Wnt/forwarder/internal/server"
 )
 
 func main() {

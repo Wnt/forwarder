@@ -1,0 +1,38 @@
+# Caddy config for a dedicated forwarder box.
+#
+# This file is the WHOLE Caddy config — the box exists to front the forwarder and
+# nothing else. If you are adding the forwarder to a box that already runs other
+# Caddy sites, do NOT install this; instead copy the two blocks below into that
+# box's Caddyfile (the global `on_demand_tls` block merges, and the catch-all
+# `https://` site loses to any named site because Caddy matches most-specific
+# host first).
+#
+# Vars come from /etc/forwarder/forwarder.env via the caddy.service.d drop-in
+# installed by install.sh.
+
+{
+	# On-demand TLS is GATED: Caddy asks the forwarder before minting a cert, and
+	# the forwarder only approves its control host or a hostname a live agent has
+	# registered. Without this gate the catch-all below would be an open relay,
+	# and anyone could burn the Let's Encrypt rate limit by opening TLS
+	# connections with made-up SNI values.
+	on_demand_tls {
+		ask http://127.0.0.1:{$FORWARDER_MGMT_PORT:7001}/ask
+	}
+
+	# Optional: set ACME_EMAIL in the env file to get LE expiry warnings.
+	email {$ACME_EMAIL:}
+}
+
+# Catch-all. Every HTTPS host that resolves here lands on the forwarder, which
+# routes by Host to whichever agent registered that hostname (and handles the
+# agents' own control WebSocket on FORWARDER_CONTROL_PATH).
+#
+# reverse_proxy passes WebSocket upgrades through transparently, so streaming
+# guests are never frame-buffered.
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy 127.0.0.1:{$FORWARDER_HTTP_PORT:7080}
+}

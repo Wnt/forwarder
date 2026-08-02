@@ -1,0 +1,78 @@
+# CI + auto-deploy.
+#
+#   pull request      -> vet + test + build (the merge gate)
+#   push to main      -> the above, then ssh to the box and redeploy, so main and
+#                        the box cannot drift
+#   workflow_dispatch -> manual "redeploy now" button
+#
+# The deploy authenticates with a dedicated ed25519 key whose authorized_keys
+# entry on the box is pinned to a forced command (deploy/redeploy.sh), so the key
+# can do nothing but trigger a redeploy. See deploy/README.md.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Serialize: never let two deploys race the box; don't cancel an in-flight one.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: vet
+        run: go vet -mod=vendor ./...
+      - name: test
+        run: go test -mod=vendor ./...
+      - name: build all binaries (server + cross-compiled agents)
+        # The box builds the server from the same vendored source, so a broken
+        # build must fail here rather than on the box mid-deploy.
+        run: make all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forwarder-binaries
+          path: bin/*
+          if-no-files-found: error
+          retention-days: 30
+
+  deploy:
+    needs: [build]
+    # Only from main (push or manual dispatch) -- never from a PR, whose code is
+    # untrusted and whose secrets would otherwise reach the box.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Redeploy over SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_HOST" -a -n "$DEPLOY_SSH_KEY" -a -n "$DEPLOY_KNOWN_HOSTS" \
+            || { echo "::error::DEPLOY_* secrets are not set"; exit 1; }
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # StrictHostKeyChecking=yes + a pinned known_hosts: a swapped host key
+          # aborts the deploy instead of trusting a new one. The literal argument
+          # is ignored (forced command); it is there to make logs legible.
+          ssh -i ~/.ssh/deploy_key \
+              -o IdentitiesOnly=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              -o StrictHostKeyChecking=yes \
+              -o ConnectTimeout=15 \
+              "root@${DEPLOY_HOST}" redeploy

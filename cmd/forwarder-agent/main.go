@@ -26,7 +26,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/Wnt/stream-connect/lab/forwarder/internal/agent"
+	"github.com/Wnt/forwarder/internal/agent"
 )
 
 func main() {
