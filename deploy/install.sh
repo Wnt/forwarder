@@ -47,15 +47,19 @@ fi
 export PATH="/usr/local/go/bin:$PATH"
 go version
 
-if ! command -v caddy >/dev/null; then
-  say "Caddy (official repo)"
+# Caddy from the official repo, and kept current: every deploy installs the
+# newest package the repo offers, so the box does not sit on an old TLS stack
+# just because it was provisioned months ago. Caddy is restarted below anyway.
+say "Caddy (official repo, latest stable)"
+if [ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]; then
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
     | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
     > /etc/apt/sources.list.d/caddy-stable.list
   apt-get update -qq
-  apt-get install -y -qq caddy >/dev/null
 fi
+apt-get install -y -qq caddy >/dev/null
+caddy version | head -1
 
 say "Environment file"
 mkdir -p "$ENV_DIR"; chmod 700 "$ENV_DIR"
