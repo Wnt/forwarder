@@ -27,10 +27,25 @@ apt-get update -qq
 apt-get install -y -qq curl git nftables debian-keyring debian-archive-keyring \
   apt-transport-https ca-certificates gnupg >/dev/null
 
-# Go: build from vendored source on the box, exactly as CI does. GOTOOLCHAIN is
-# pinned to `local` at build time so a go.mod bump can never trigger a toolchain
-# download on a 1 GB box.
-command -v go >/dev/null || apt-get install -y -qq golang-go >/dev/null
+# Go: install the exact toolchain go.mod asks for, straight from go.dev.
+#
+# NOT Debian's golang-go: trixie ships 1.24 while go.mod tracks current stable, so
+# apt's Go would fail the build the moment the two diverge. Pinning to go.mod also
+# means the box, CI and a laptop all compile with the same compiler.
+#
+# GOTOOLCHAIN=local at build time keeps the build hermetic: with the right
+# toolchain already installed, Go never reaches out to download another one.
+GO_VERSION="$(awk '/^go /{print $2; exit}' "$REPO_DIR/go.mod")"
+[ -n "$GO_VERSION" ] || die "could not read the go directive from go.mod"
+if [ "$(/usr/local/go/bin/go version 2>/dev/null | awk '{print $3}')" != "go${GO_VERSION}" ]; then
+  say "Go ${GO_VERSION}"
+  curl -fsSL -o /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+  rm -rf /usr/local/go
+  tar xzf /tmp/go.tgz -C /usr/local
+  rm -f /tmp/go.tgz
+fi
+export PATH="/usr/local/go/bin:$PATH"
+go version
 
 if ! command -v caddy >/dev/null; then
   say "Caddy (official repo)"

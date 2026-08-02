@@ -92,7 +92,7 @@ chmod +x bin/forwarder-agent-*        # artifacts arrive without the exec bit
 
 (Or: GitHub → Actions → a green **CI** run → Artifacts → `forwarder-binaries`.)
 
-**Build from source** — needs Go ≥ 1.23; hermetic (vendored deps, no network
+**Build from source** — needs the Go version in `go.mod` (current stable; `deploy/install.sh` installs it from go.dev on the box); hermetic (vendored deps, no network
 fetch), exactly how the box rebuilds the server during redeploy:
 
 ```bash
