@@ -24,7 +24,7 @@ die() { printf '\033[31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
 say "Packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl git nftables debian-keyring debian-archive-keyring \
+apt-get install -y -qq curl git nftables unzip debian-keyring debian-archive-keyring \
   apt-transport-https ca-certificates gnupg >/dev/null
 
 # Go: install the exact toolchain go.mod asks for, straight from go.dev.
@@ -191,6 +191,16 @@ fi
 # out of band (deploy/README.md). It deliberately holds no restic password.
 if [ -f /etc/forwarder/escrow/rclone.conf ]; then
   say "Backup watchdog"
+  # The watchdog talks to Drive through rclone, which is otherwise not needed on
+  # this box. Without it the watchdog alerts every run with "command not found"
+  # — a false alarm that trains you to ignore real ones.
+  if ! command -v rclone >/dev/null; then
+    CV=$(curl -fsS https://downloads.rclone.org/version.txt | awk '{print $2}')
+    curl -fsSL -o /tmp/rc.zip "https://downloads.rclone.org/${CV}/rclone-${CV}-linux-amd64.zip"
+    ( cd /tmp && unzip -oq rc.zip && install -m 755 "rclone-${CV}-linux-amd64/rclone" /usr/local/bin/rclone \
+      && rm -rf rc.zip "rclone-${CV}-linux-amd64" )
+  fi
+  rclone version | head -1
   install -m 700 "$REPO_DIR/deploy/backup-watchdog.sh" /usr/local/bin/backup-watchdog
   cat > /etc/systemd/system/backup-watchdog.service <<'UNIT'
 [Unit]
