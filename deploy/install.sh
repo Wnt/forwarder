@@ -187,6 +187,33 @@ else
   systemctl disable --now wg-quick@wg0 >/dev/null 2>&1 || true
 fi
 
+# The backup watchdog is inert unless its Drive credential has been placed here
+# out of band (deploy/README.md). It deliberately holds no restic password.
+if [ -f /etc/forwarder/escrow/rclone.conf ]; then
+  say "Backup watchdog"
+  install -m 700 "$REPO_DIR/deploy/backup-watchdog.sh" /usr/local/bin/backup-watchdog
+  cat > /etc/systemd/system/backup-watchdog.service <<'UNIT'
+[Unit]
+Description=Alert if the offsite backup has gone stale
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/backup-watchdog
+UNIT
+  cat > /etc/systemd/system/backup-watchdog.timer <<'UNIT'
+[Unit]
+Description=Check offsite backup freshness twice daily
+[Timer]
+# Twice a day, offset from the 03:30 backup so a late run is not flagged.
+OnCalendar=*-*-* 09,21:00:00
+RandomizedDelaySec=15m
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now backup-watchdog.timer >/dev/null 2>&1 || true
+fi
+
 say "Firewall"
 if [ -n "${FORWARDER_TCP_PORT_RANGE:-}" ]; then
   lo="${FORWARDER_TCP_PORT_RANGE%%-*}"; hi="${FORWARDER_TCP_PORT_RANGE##*-}"
