@@ -50,36 +50,38 @@ export RCLONE_CONFIG="$RCLONE_CONFIG_FILE"
 
 # Failing to list at all is itself the alert: Drive revoked the token, the OAuth
 # client was deleted, or the folder is gone.
-if ! listing=$(rclone lsl "${REMOTE}/snapshots/" 2>&1); then
+# lsjson, not lsl: lsl prints times in the machine's LOCAL zone with no offset,
+# so a timezone difference would silently skew freshness by hours in either
+# direction. lsjson emits RFC3339 with an explicit offset.
+if ! listing=$(rclone lsjson "${REMOTE}/snapshots/" 2>&1); then
   alert "cannot list the backup repository: $(printf '%s' "$listing" | tail -2 | tr '\n' ' ' | cut -c1-300)"
   exit 1
 fi
 
-if [ -z "$(printf '%s' "$listing" | tr -d '[:space:]')" ]; then
-  alert "the backup repository contains NO snapshots at all"
-  exit 1
-fi
-
-age_h=$(printf '%s\n' "$listing" | python3 -c "
-import sys, datetime
-newest = None
-for line in sys.stdin:
-    parts = line.split(None, 3)          # size, date, time, name
-    if len(parts) < 3:
+age_h=$(printf '%s' "$listing" | python3 -c "
+import sys, json, datetime
+try:
+    entries = json.load(sys.stdin)
+except Exception:
+    print(-1); raise SystemExit
+times = []
+for e in entries:
+    mt = e.get('ModTime')
+    if not mt:
         continue
     try:
-        t = datetime.datetime.fromisoformat(parts[1] + ' ' + parts[2][:15])
+        times.append(datetime.datetime.fromisoformat(mt.replace('Z', '+00:00')))
     except ValueError:
-        continue
-    newest = t if newest is None or t > newest else newest
-if newest is None:
+        pass
+if not times:
     print(-1)
 else:
-    print(int((datetime.datetime.utcnow() - newest).total_seconds() // 3600))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    print(int((now - max(times)).total_seconds() // 3600))
 ")
 
 if [ -z "$age_h" ] || [ "$age_h" = "-1" ]; then
-  alert "could not determine the age of the newest snapshot"
+  alert "the backup repository contains NO usable snapshots"
   exit 1
 fi
 
