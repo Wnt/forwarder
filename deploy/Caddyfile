@@ -20,8 +20,9 @@
 		ask http://127.0.0.1:{$FORWARDER_MGMT_PORT:7001}/ask
 	}
 
-	# Optional: set ACME_EMAIL in the env file to get LE expiry warnings.
-	email {$ACME_EMAIL:}
+	# No `email` here on purpose: an empty placeholder fails `caddy validate`,
+	# which would block every deploy on a box that never set one. Add
+	# `email you@example.com` by hand if you want Let's Encrypt expiry warnings.
 }
 
 # Catch-all. Every HTTPS host that resolves here lands on the forwarder, which
