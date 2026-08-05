@@ -133,6 +133,9 @@ Server config (env, all optional except the token — defaults in parentheses):
 | `FORWARDER_TCP_PORT_RANGE` | *(unset = off)* | enable raw TCP tunnels on this port range, e.g. `10000-19999` (live on the box; see Raw TCP below) |
 | `FORWARDER_TCP_BIND` | `0.0.0.0` | interface TCP tunnel listeners bind |
 | `FORWARDER_PUBLIC_HOST` | *(unset)* | pretty host shown in a TCP tunnel's assigned address |
+| `UDP_RELAY_PEER_IP` | *(unset = off)* | WireGuard address of the peer a public UDP range is DNAT'd to (see UDP relay below) |
+| `UDP_RELAY_PEER_PUBKEY` | *(unset)* | that peer's WireGuard public key |
+| `UDP_RELAY_PORT_RANGE` | *(unset)* | the public UDP range to relay, e.g. `54080-54130` |
 
 ## Agent (next to your app) — e.g. the iOS-pwa-runner
 
@@ -252,6 +255,49 @@ second agent requesting a bound port is rejected in its `RegisteredMsg`.
 > Raw TCP carries no per-tunnel auth of its own — whatever you expose is as
 > reachable as the app behind it. Keep the range tight and expose only services
 > that authenticate (sshd, etc.).
+
+## UDP relay — opt-in, and not a tunnel
+
+Everything above is TCP: HTTP/WS rides Caddy on `:443`, raw TCP gets its own
+public port. A **QUIC** app has neither option — WebTransport is UDP end to end,
+and there is no way to carry it over a TCP tunnel without replacing its loss
+recovery with TCP's, which is exactly what a low-latency media app was avoiding.
+
+So UDP is handled at the kernel, not by the forwarder daemon: a public UDP port
+range is DNAT'd over WireGuard to **one** peer that dials out and holds the
+tunnel open. The `forwarder-agent` is not involved; nothing is multiplexed; the
+datagrams stay datagrams, and loss stays loss.
+
+```
+browser ──UDP :54081──► box (dnat + snat) ──wg0──► peer 10.66.0.3:54081 ──► app
+```
+
+Set on the box (`/etc/forwarder/forwarder.env`), then redeploy:
+
+```
+UDP_RELAY_PEER_IP=10.66.0.3
+UDP_RELAY_PEER_PUBKEY=<the peer's wg pubkey>
+UDP_RELAY_PORT_RANGE=54080-54130
+WG_EDGE_PRIVKEY=<wg genkey>        # shared with the site tunnel if both are on
+```
+
+That renders a second `[Peer]` into `wg0.conf`, appends the `forwarder_nat`
+table, opens the range in nftables, and installs the one `ip_forward` drop-in on
+the box. **The port is never translated** — public `:N` is peer `:N` — so the app
+needs no port map and its signaling only has to advertise a different host.
+Source addresses are rewritten to `WG_EDGE_ADDR`, because the peer has no route
+back to an arbitrary internet client; the peer sees every client as the tunnel
+address with a distinct source port, which is all a per-connection protocol like
+QUIC needs to keep its 4-tuples apart.
+
+The peer side is an ordinary `wg-quick` client with `PersistentKeepalive` — see
+[`examples/wg-peer.conf`](examples/wg-peer.conf).
+
+> Like raw TCP, the relay adds **no auth of its own**. It is a hole in the
+> firewall to one host's ports. Only point it at something that authenticates its
+> own sessions, keep the range tight, and remember that the forward chain's
+> default is still drop — the relay range to the relay peer is the only thing
+> that crosses it.
 
 ## Phase 3: WebRTC / coturn (not here)
 

@@ -146,25 +146,70 @@ if ! ( set -a; source "$ENV_FILE"; set +a; caddy validate --config /etc/caddy/Ca
   die "caddy validate failed — not restarting"
 fi
 
-if [ -n "${SITE_PEER_IP:-}" ]; then
-  say "Site tunnel (WireGuard) + HAProxy"
-  dpkg -s haproxy   >/dev/null 2>&1 || apt-get install -y -qq haproxy >/dev/null
+# One WireGuard interface, brought up by either feature that needs a tunnel to a
+# NAT'd peer: the site tunnel (HAProxy in front) and/or the UDP relay (nftables
+# dnat). Each contributes one [Peer] block.
+if [ -n "${SITE_PEER_IP:-}" ] || [ -n "${UDP_RELAY_PEER_IP:-}" ]; then
+  say "WireGuard"
   dpkg -s wireguard-tools >/dev/null 2>&1 || apt-get install -y -qq wireguard-tools >/dev/null
 
   : "${WG_PORT:=51820}" "${WG_EDGE_ADDR:=10.66.0.1}"
-  [ -n "${WG_EDGE_PRIVKEY:-}" ]  || die "WG_EDGE_PRIVKEY is unset (see deploy/env.example)"
-  [ -n "${WG_PEER_PUBKEY:-}" ]   || die "WG_PEER_PUBKEY is unset"
-  [ -n "${SITE_HOSTS:-}" ]       || die "SITE_HOSTS is unset"
+  [ -n "${WG_EDGE_PRIVKEY:-}" ] || die "WG_EDGE_PRIVKEY is unset (see deploy/env.example)"
 
+  peers=""
+  if [ -n "${SITE_PEER_IP:-}" ]; then
+    [ -n "${WG_PEER_PUBKEY:-}" ] || die "WG_PEER_PUBKEY is unset"
+    peers="[Peer]
+# Site tunnel: HAProxy forwards the site hostnames to this peer.
+PublicKey = ${WG_PEER_PUBKEY}
+AllowedIPs = ${SITE_PEER_IP}/32
+"
+  fi
+  if [ -n "${UDP_RELAY_PEER_IP:-}" ]; then
+    [ -n "${UDP_RELAY_PEER_PUBKEY:-}" ] || die "UDP_RELAY_PEER_PUBKEY is unset"
+    peers="${peers}${peers:+
+}[Peer]
+# UDP relay: public ${UDP_RELAY_PORT_RANGE:-?}/udp is dnat'd to this peer.
+PublicKey = ${UDP_RELAY_PEER_PUBKEY}
+AllowedIPs = ${UDP_RELAY_PEER_IP}/32
+"
+  fi
+
+  # python3, not sed: the peer list is multi-line, which sed cannot substitute.
   umask 077
-  sed -e "s|@WG_EDGE_ADDR@|${WG_EDGE_ADDR}|" \
-      -e "s|@WG_PORT@|${WG_PORT}|" \
-      -e "s|@WG_EDGE_PRIVKEY@|${WG_EDGE_PRIVKEY}|" \
-      -e "s|@WG_PEER_PUBKEY@|${WG_PEER_PUBKEY}|" \
-      -e "s|@SITE_PEER_IP@|${SITE_PEER_IP}|" \
-      "$REPO_DIR/deploy/wg0.conf" > /etc/wireguard/wg0.conf
+  python3 - "$REPO_DIR/deploy/wg0.conf" "$WG_EDGE_ADDR" "$WG_PORT" \
+    "$WG_EDGE_PRIVKEY" "$peers" > /etc/wireguard/wg0.conf <<'PY'
+import sys
+src, addr, port, privkey, peers = sys.argv[1:6]
+out = open(src).read()
+for key, val in (("@WG_EDGE_ADDR@", addr), ("@WG_PORT@", port),
+                 ("@WG_EDGE_PRIVKEY@", privkey), ("@WG_PEERS@", peers)):
+    out = out.replace(key, val)
+sys.stdout.write(out)
+PY
   chmod 600 /etc/wireguard/wg0.conf
   umask 022
+
+  systemctl enable wg-quick@wg0 >/dev/null 2>&1 || true
+  systemctl restart wg-quick@wg0
+else
+  systemctl disable --now wg-quick@wg0 >/dev/null 2>&1 || true
+fi
+
+# The UDP relay is the only thing here that routes packets, so it owns the
+# ip_forward drop-in. Disabling it removes the drop-in but does not flip the
+# running sysctl back: something else on the box may since have needed it.
+if [ -n "${UDP_RELAY_PEER_IP:-}" ]; then
+  echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-forwarder-udp-relay.conf
+  sysctl -q -w net.ipv4.ip_forward=1
+else
+  rm -f /etc/sysctl.d/99-forwarder-udp-relay.conf
+fi
+
+if [ -n "${SITE_PEER_IP:-}" ]; then
+  say "Site tunnel (HAProxy)"
+  dpkg -s haproxy >/dev/null 2>&1 || apt-get install -y -qq haproxy >/dev/null
+  [ -n "${SITE_HOSTS:-}" ] || die "SITE_HOSTS is unset"
 
   sed -e "s|@SITE_HOSTS@|${SITE_HOSTS}|" \
       -e "s|@SITE_SUFFIX@|${SITE_SUFFIX:-.invalid}|" \
@@ -178,13 +223,10 @@ if [ -n "${SITE_PEER_IP:-}" ]; then
   # a config error would take the tunnel down with it.
   haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null || die "haproxy config rejected"
 
-  systemctl enable wg-quick@wg0 >/dev/null 2>&1 || true
-  systemctl restart wg-quick@wg0
   systemctl enable haproxy >/dev/null 2>&1 || true
 else
   # No site tunnel: make sure a previously-installed HAProxy isn't holding :443.
-  systemctl disable --now haproxy   >/dev/null 2>&1 || true
-  systemctl disable --now wg-quick@wg0 >/dev/null 2>&1 || true
+  systemctl disable --now haproxy >/dev/null 2>&1 || true
 fi
 
 # The backup watchdog is inert unless its Drive credential has been placed here
@@ -231,13 +273,32 @@ if [ -n "${FORWARDER_TCP_PORT_RANGE:-}" ]; then
 else
   rule="# raw TCP tunnels disabled (FORWARDER_TCP_PORT_RANGE unset)"
 fi
-if [ -n "${SITE_PEER_IP:-}" ]; then
+if [ -n "${SITE_PEER_IP:-}" ] || [ -n "${UDP_RELAY_PEER_IP:-}" ]; then
   wg_rule="udp dport ${WG_PORT:-51820} accept"
 else
-  wg_rule="# site tunnel disabled (SITE_PEER_IP unset)"
+  wg_rule="# no tunnel peers (SITE_PEER_IP and UDP_RELAY_PEER_IP both unset)"
+fi
+# The relay range reaches the peer through the forward chain, not input: the
+# dnat in forwarder_nat has already rewritten the destination by then.
+if [ -n "${UDP_RELAY_PEER_IP:-}" ]; then
+  case "${UDP_RELAY_PORT_RANGE:-}" in
+    [0-9]*-[0-9]*) : ;;
+    *) die "UDP_RELAY_PORT_RANGE must look like 54080-54130 (got '${UDP_RELAY_PORT_RANGE:-}')" ;;
+  esac
+  udp_ports="${UDP_RELAY_PORT_RANGE%%-*}-${UDP_RELAY_PORT_RANGE##*-}"
+  udp_rule="ip daddr ${UDP_RELAY_PEER_IP} udp dport { ${udp_ports} } accept"
+else
+  udp_rule="# UDP relay disabled (UDP_RELAY_PEER_IP unset)"
 fi
 sed -e "s|@FWD_TCP_RULE@|${rule}|" -e "s|@WG_RULE@|${wg_rule}|" \
+    -e "s|@FWD_UDP_RELAY_RULE@|${udp_rule}|" \
     "$REPO_DIR/deploy/nftables.conf" > /etc/nftables.conf
+if [ -n "${UDP_RELAY_PEER_IP:-}" ]; then
+  sed -e "s|@UDP_RELAY_PORTS@|${udp_ports}|g" \
+      -e "s|@UDP_RELAY_PEER_IP@|${UDP_RELAY_PEER_IP}|g" \
+      -e "s|@WG_EDGE_ADDR@|${WG_EDGE_ADDR:-10.66.0.1}|g" \
+      "$REPO_DIR/deploy/nftables-udp-relay.conf" >> /etc/nftables.conf
+fi
 chmod 755 /etc/nftables.conf
 nft -c -f /etc/nftables.conf || die "nftables ruleset rejected — not applying"
 systemctl enable --now nftables >/dev/null 2>&1 || true
