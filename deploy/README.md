@@ -15,6 +15,7 @@ and a long-lived one converge on the same state.
 | `nftables.conf` | Host firewall. Inbound dropped by default; only 22/80/443 plus the raw-TCP tunnel range when enabled. |
 | `systemd/forwarder.service` | The server unit — loopback-pinned and hardened. |
 | `env.example` | Template for `/etc/forwarder/forwarder.env` (root, 0600). **No secrets in the repo.** |
+| `site.env` | **Repo-owned deployment config.** Non-secret keys pinned in git; sourced after the box's env file and wins for the keys it sets. Change it with a commit — CI redeploys. |
 
 ## From zero
 

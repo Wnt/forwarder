@@ -81,6 +81,22 @@ set -a; source "$ENV_FILE"; set +a
 [ -n "${FORWARDER_CONTROL_HOST:-}" ] || \
   echo "WARNING: FORWARDER_CONTROL_HOST is unset — agents cannot dial in until it is set"
 
+# Repo overlay: deploy/site.env carries this deployment's NON-SECRET settings,
+# so changing one (say, widening UDP_RELAY_PORT_RANGE) is a commit on main that
+# CI deploys — no shell on the box, and the value is somewhere a review can see.
+# Sourced after forwarder.env, so a key set here is owned by the repo and wins;
+# keys it leaves unset keep their box-local values. Secrets stay in
+# forwarder.env, which nothing in git ever writes.
+SITE_ENV="$REPO_DIR/deploy/site.env"
+if [ -f "$SITE_ENV" ]; then
+  if grep -qE '^[[:space:]]*(FORWARDER_AGENT_TOKEN|WG_EDGE_PRIVKEY)[[:space:]]*=' "$SITE_ENV"; then
+    die "deploy/site.env sets a secret — secrets live only in $ENV_FILE"
+  fi
+  # shellcheck disable=SC1090
+  set -a; source "$SITE_ENV"; set +a
+  echo "applied repo overlay deploy/site.env"
+fi
+
 say "Build forwarder-server"
 ( cd "$REPO_DIR" && GOTOOLCHAIN=local GOFLAGS=-mod=vendor \
     go build -o /usr/local/bin/forwarder-server.new ./cmd/forwarder-server )
