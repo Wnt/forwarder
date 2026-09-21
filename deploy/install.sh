@@ -142,13 +142,20 @@ if [ -n "${SITE_PEER_IP:-}" ]; then
   CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-8443}"
   ports=$(printf '\thttp_port %s\n\thttps_port %s' "$CADDY_HTTP_PORT" "$CADDY_HTTPS_PORT")
   bind=$'\tbind 127.0.0.1'
+  # HAProxy TCP-splits :443, so Caddy's peer is loopback and every visitor would
+  # be recorded as 127.0.0.1. HAProxy sends the real address ahead of the TLS
+  # handshake (send-proxy-v2 in deploy/haproxy.cfg) and this wrapper turns it
+  # back into the connection's peer. `allow 127.0.0.1/32` is the trust boundary:
+  # only HAProxy on this box may assert an address. `tls` MUST stay last.
+  wrappers=$(printf '\tservers {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol {\n\t\t\t\tallow 127.0.0.1/32\n\t\t\t}\n\t\t\ttls\n\t\t}\n\t}')
 else
-  ports=""; bind=""
+  ports=""; bind=""; wrappers=""
 fi
-python3 - "$REPO_DIR/deploy/Caddyfile" "$ports" "$bind" > /etc/caddy/Caddyfile <<'PY'
+python3 - "$REPO_DIR/deploy/Caddyfile" "$ports" "$bind" "$wrappers" > /etc/caddy/Caddyfile <<'PY'
 import sys
-src, ports, bind = sys.argv[1], sys.argv[2], sys.argv[3]
-out = open(src).read().replace("@CADDY_PORTS@", ports).replace("@CADDY_BIND@", bind)
+src, ports, bind, wrappers = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+out = (open(src).read().replace("@CADDY_PORTS@", ports).replace("@CADDY_BIND@", bind)
+       .replace("@CADDY_LISTENER_WRAPPERS@", wrappers))
 # Drop the lines that render empty so the result stays clean.
 sys.stdout.write("\n".join(l for l in out.split("\n") if l.strip() != "" or True))
 PY

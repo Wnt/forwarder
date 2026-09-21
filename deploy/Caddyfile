@@ -14,6 +14,14 @@
 #
 # Vars come from /etc/forwarder/forwarder.env via the caddy.service.d drop-in
 # installed by install.sh.
+#
+# BEHIND HAPROXY, CADDY ALSO SPEAKS THE PROXY PROTOCOL. :443 is SNI-split in TCP
+# mode, so without this Caddy's peer is HAProxy on loopback and every public
+# visitor is recorded as 127.0.0.1 — which is exactly what the gallery's serving
+# plane measured on every request. The proxy_protocol listener wrapper restores
+# the true peer, and `allow` restricts that trust to loopback so nothing
+# reachable from outside can assert an address. The `tls` wrapper MUST stay last:
+# wrappers run in order, and the PROXY header is in front of the TLS handshake.
 
 {
 	# On-demand TLS is GATED: Caddy asks the forwarder before minting a cert, and
@@ -29,6 +37,7 @@
 	# which would block every deploy on a box that never set one. Add
 	# `email you@example.com` by hand if you want Let's Encrypt expiry warnings.
 @CADDY_PORTS@
+@CADDY_LISTENER_WRAPPERS@
 }
 
 # Catch-all. Every HTTPS host that resolves here lands on the forwarder, which
