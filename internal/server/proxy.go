@@ -297,30 +297,64 @@ func tokenInHeader(h http.Header, key, want string) bool {
 	return false
 }
 
-// setForwardingHeaders fills the standard proxy headers only if Caddy (the real
-// TLS terminator in front) somehow didn't, so we never clobber the true client
-// IP Caddy already recorded.
+// setForwardingHeaders REPLACES the forwarding headers with what this hop can
+// actually vouch for, rather than passing on what arrived.
+//
+// It used to fill X-Forwarded-For "only if empty, so we never clobber the true
+// client IP Caddy already recorded". Two things were wrong with that. Caddy
+// APPENDS to whatever the client sent, so a non-empty header is not evidence of
+// truth — it is `<whatever the client made up>, <the address Caddy saw>`. And a
+// downstream reader taking the first hop (the conventional choice) would read
+// the client's own invention. Anything trusting this header for rate limiting,
+// geography or an audit trail was therefore trusting the caller.
+//
+// So: collapse it to the ONE value realIP vouches for, and overwrite. Callers
+// downstream get a single-valued header they can use without parsing a trust
+// boundary they cannot see from where they sit.
 func setForwardingHeaders(r *http.Request) {
-	if r.Header.Get("X-Forwarded-Proto") == "" {
-		r.Header.Set("X-Forwarded-Proto", "https")
-	}
-	if r.Header.Get("X-Forwarded-For") == "" {
-		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			r.Header.Set("X-Forwarded-For", host)
-		}
+	r.Header.Set("X-Forwarded-Proto", "https")
+	if ip := realIP(r); ip != "" {
+		r.Header.Set("X-Forwarded-For", ip)
+		r.Header.Set("X-Real-IP", ip)
 	}
 }
 
-// realIP is the best-effort public client IP: the first X-Forwarded-For hop that
-// Caddy recorded, else the immediate peer.
+// realIP is the client address this hop is willing to assert.
+//
+// THE TRUST BOUNDARY. Our own Caddy is the TLS terminator immediately in front
+// and reaches us over loopback, and it appends the address it saw to any
+// X-Forwarded-For the client supplied. So when the peer is loopback the LAST
+// entry is Caddy's own observation and every earlier entry is the client
+// talking about itself; we take the last and discard the rest. When the peer is
+// NOT loopback the request did not come through Caddy, so the header carries no
+// weight at all and only the socket peer is real.
+//
+// This is what makes the header trustworthy downstream: past this point
+// X-Forwarded-For is single-valued and was written by a hop that could see the
+// connection, not by whoever opened it.
 func realIP(r *http.Request) string {
+	peer, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		peer = r.RemoteAddr
+	}
+	if !isLoopback(peer) {
+		return peer
+	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])
+		parts := strings.Split(xff, ",")
+		last := strings.TrimSpace(parts[len(parts)-1])
+		if last != "" {
+			return last
+		}
 	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
+	return peer
+}
+
+// isLoopback reports whether addr is this box talking to itself — the only
+// position from which our own Caddy can hand us an address to believe.
+func isLoopback(addr string) bool {
+	ip := net.ParseIP(addr)
+	return ip != nil && ip.IsLoopback()
 }
 
 func copyHeader(dst, src http.Header) {
