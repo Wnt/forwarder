@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Wnt/forwarder/internal/framing"
 	"github.com/coder/websocket"
@@ -165,7 +166,25 @@ func (s *Server) handlePublic(w http.ResponseWriter, r *http.Request) {
 }
 
 // proxyHTTP forwards a single (non-upgrade) request/response over the stream.
+//
+// The public client going away must end the request at the app at once. The
+// copy loop below only learns about the client when a write to it fails, and a
+// streaming response (SSE, long poll) may not write for a long time — or ever
+// fail, if the peer only half-closed. Meanwhile the app keeps the request open
+// and counts it against whatever per-client limit it has: on 2026-10-18 an
+// EventSource gateway behind this tunnel filled its per-account cap with streams
+// whose browsers had long gone. So tie the stream to the request context: when
+// net/http cancels it (client EOF, reset, or Caddy cancelling its upstream
+// request), close the tunnel stream — the agent then closes its local
+// connection, which is how the app sees the disconnect — and unblock our own
+// read of the response.
 func proxyHTTP(w http.ResponseWriter, r *http.Request, st *yamux.Stream) {
+	stop := context.AfterFunc(r.Context(), func() {
+		st.Close()
+		st.SetDeadline(time.Now())
+	})
+	defer stop()
+
 	// Re-serialize the request to the agent in origin form. r.Write preserves the
 	// original Host and writes the body, which is exactly what the runner behind
 	// the agent expects.
@@ -182,7 +201,7 @@ func proxyHTTP(w http.ResponseWriter, r *http.Request, st *yamux.Stream) {
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	// Flush as we go so streaming responses (SSE, chunked) reach the client live.
-	io.Copy(flushWriter{w}, resp.Body)
+	io.Copy(flushWriter{w: w, rc: http.NewResponseController(w)}, resp.Body)
 }
 
 // proxyWS hijacks the client connection and raw-pipes it to the stream after
@@ -366,12 +385,20 @@ func copyHeader(dst, src http.Header) {
 }
 
 // flushWriter flushes after every write so proxied streaming bodies aren't held.
-type flushWriter struct{ w http.ResponseWriter }
+// A failed flush is a failed write: the bytes never left, and the client is gone,
+// so the copy must stop rather than keep draining the app into a dead socket.
+type flushWriter struct {
+	w  http.ResponseWriter
+	rc *http.ResponseController
+}
 
 func (f flushWriter) Write(p []byte) (int, error) {
 	n, err := f.w.Write(p)
-	if fl, ok := f.w.(http.Flusher); ok {
-		fl.Flush()
+	if err != nil {
+		return n, err
 	}
-	return n, err
+	if err := f.rc.Flush(); err != nil {
+		return n, err
+	}
+	return n, nil
 }
