@@ -172,11 +172,14 @@ func (s *Server) handlePublic(w http.ResponseWriter, r *http.Request) {
 		st, err = as.sess.OpenStream()
 	}
 	fail := func(message string, err error) {
-		code := gatewayStatus(err)
-		// net/http cancels the request after an upload read deadline; that can
-		// surface as a closed stream rather than a net.Error timeout.
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			code = http.StatusGatewayTimeout
+		code := http.StatusBadGateway
+		if host != nil {
+			code = gatewayStatus(err)
+			// An upload read deadline can surface as a closed stream after
+			// net/http cancels the request, rather than a net.Error timeout.
+			if !deadline.IsZero() && !time.Now().Before(deadline) {
+				code = http.StatusGatewayTimeout
+			}
 		}
 		s.publicError(w, r, message, code)
 	}
