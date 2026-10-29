@@ -267,7 +267,9 @@ an independent HTTP fetch and a 5 MB WebSocket echo on one session.
 `tools/tunnel-load` keeps ten real multiplayer WebSockets open while each player
 fetches a list of cached manifest/GLB/collision paths in parallel. It reports full
 body p50/p95, transport failures, status counts, missing CORS/retry headers and
-WebSocket health without logging session tokens:
+WebSocket health without logging session tokens. It validates JSON and hashed
+asset SHA-256s, and exits nonzero on HTTP 5xx, transport, validation, CORS/retry
+or WebSocket failures:
 
 ```sh
 go run -mod=vendor ./tools/tunnel-load -paths /tmp/public-paths.txt \
