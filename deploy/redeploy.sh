@@ -15,9 +15,17 @@ REPO_DIR="${REPO_DIR:-/opt/forwarder}"
 BRANCH="${BRANCH:-main}"
 
 cd "$REPO_DIR"
+previous=$(git rev-parse HEAD)
 echo "== sync ${BRANCH}"
 git fetch --quiet origin "$BRANCH"
 git reset --hard "origin/${BRANCH}"
 git --no-pager log --oneline -1
+
+# Application-only changes need no package, firewall, Caddy, HAProxy or
+# WireGuard changes. Restart just the forwarder; agents reconnect themselves.
+if ! git diff --name-only "$previous" HEAD | grep -qvE \
+  '^(internal/|cmd/|tools/tunnel-load/|README\.md$|deploy/(hosts\.json|server\.env|systemd/forwarder\.service|redeploy(-server)?\.sh|README\.md)$)'; then
+  exec "${REPO_DIR}/deploy/redeploy-server.sh"
+fi
 
 exec "${REPO_DIR}/deploy/install.sh"

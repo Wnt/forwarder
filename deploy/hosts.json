@@ -1,0 +1,7 @@
+{
+  "turku.lab.madekivi.fi": {
+    "max_conns": 1024,
+    "header_timeout_seconds": 35,
+    "allowed_origins": ["https://wnt.github.io"]
+  }
+}

@@ -130,6 +130,7 @@ Server config (env, all optional except the token — defaults in parentheses):
 | `FORWARDER_MGMT_PORT` | `7001` | loopback `/ask` + `/status` + `/healthz` |
 | `FORWARDER_CONTROL_PATH` | `/__forwarder/v1/control` | reserved control-WS path |
 | `FORWARDER_MAX_CONNS_PER_TUNNEL` | `256` | per-agent concurrent public connections |
+| `FORWARDER_HOST_POLICIES_FILE` | *(unset)* | optional JSON file of exact-Host capacity, header timeout and gateway-error CORS policies |
 | `FORWARDER_TCP_PORT_RANGE` | *(unset = off)* | enable raw TCP tunnels on this port range, e.g. `10000-19999` (live on the box; see Raw TCP below) |
 | `FORWARDER_TCP_BIND` | `0.0.0.0` | interface TCP tunnel listeners bind |
 | `FORWARDER_PUBLIC_HOST` | *(unset)* | pretty host shown in a TCP tunnel's assigned address |
@@ -219,6 +220,67 @@ passkeys. Never run the app with `RPID=localhost` behind the tunnel.)
 On the box: `curl -s 127.0.0.1:7001/status` (connected agents, registered hosts +
 TCP ports), `curl -s 127.0.0.1:7001/healthz`, `journalctl -u forwarder -f`. From a
 guest, `forwarder-agent` logs the public address each tunnel went live at.
+
+`/status` also reports each agent's shared active/limit counts and yamux stream
+count (including its control stream). `host_limits` reports configured hosts'
+active, peak, rejected and forwarder-error counts since process startup.
+
+### Per-host capacity and gateway errors
+
+The live deployment's [host policies](deploy/hosts.json) give
+`turku.lab.madekivi.fi` **1,024 concurrent requests/WebSockets** independently of
+the legacy shared 256-connection agent limit. Ten players with 32 parallel tile
+fetches and one multiplayer WebSocket each need 330 slots; 1,024 leaves room for
+retries, slot switches and other requests. Other guests retain their existing
+shared limit and response headers. HTTP keepalive sockets do not occupy slots:
+one request uses one yamux stream and one agent-to-app TCP connection.
+
+Policies are keyed by canonical Host (case-insensitive, port/trailing dot
+removed). Example:
+
+```json
+{
+  "app.example.com": {
+    "max_conns": 1024,
+    "header_timeout_seconds": 35,
+    "allowed_origins": ["https://wnt.github.io"]
+  }
+}
+```
+
+The timeout bounds stream opening, request upload and response headers, including
+WebSocket handshakes. It clears once headers arrive so streamed bodies and
+WebSockets can stay open. No request/response body size cap is introduced.
+Gateway errors before response headers (missing agent, exhausted capacity,
+upstream loss or timeout) get `Retry-After: 5`, `Cache-Control: no-store`, and
+`Vary: Origin`. An exact allowlisted Origin also gets the app's CORS method,
+header, exposed-header and timing headers. This policy still works while the
+agent is absent; it never authorizes a certificate or another hostname.
+
+yamux supplies independent stream windows; a stopped reader does not block
+unrelated streams. The outer WebSocket still uses one TCP connection, so packet
+loss can delay that connection's packets. The 4 MB control-WebSocket message
+limit applies to transport frames, not proxied bodies or app WebSocket frames.
+The end-to-end capacity test checks 300 held requests, ten unread large bodies,
+an independent HTTP fetch and a 5 MB WebSocket echo on one session.
+
+`tools/tunnel-load` keeps ten real multiplayer WebSockets open while each player
+fetches a list of cached manifest/GLB/collision paths in parallel. It reports full
+body p50/p95, transport failures, status counts, missing CORS/retry headers and
+WebSocket health without logging session tokens:
+
+```sh
+go run -mod=vendor ./tools/tunnel-load -paths /tmp/public-paths.txt \
+  -clients 10 -parallel 16 -rounds 3 -timeout 5s
+# Compare with OCI's existing proxy via a private SSH port forward:
+ssh -N -L 127.0.0.1:18764:127.0.0.1:7764 oci-turku
+go run -mod=vendor ./tools/tunnel-load -paths /tmp/public-paths.txt \
+  -base http://127.0.0.1:18764 -ws ws://127.0.0.1:18764/ \
+  -clients 10 -parallel 16 -rounds 3 -timeout 5s
+```
+
+Use a separate terminal for SSH. Compare identical paths and concurrency; cached
+asset transfer tests do not establish the tile generator's production capacity.
 
 ## Raw TCP tunnels (Phase 2) — opt-in
 

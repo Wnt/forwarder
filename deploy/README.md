@@ -11,11 +11,19 @@ and a long-lived one converge on the same state.
 | `cloud-init.yaml` | First-boot user_data. Thin: seeds the env file, clones the repo, runs `install.sh`. |
 | `install.sh` | **Box-side, idempotent.** apt deps + Caddy, builds `forwarder-server` from vendored source, installs the unit + Caddyfile + nftables, validates, restarts, health-gates. |
 | `redeploy.sh` | **Box-side.** `git reset --hard origin/main` then `install.sh`. The forced command the CI deploy key is pinned to. |
+| `redeploy-server.sh` | Builds and restarts only the daemon for source/host-policy changes; selected automatically by `redeploy.sh`. |
 | `Caddyfile` | The whole Caddy config for a dedicated box: gated on-demand TLS + the catch-all site proxying to the forwarder. |
 | `nftables.conf` | Host firewall. Inbound dropped by default; only 22/80/443 plus the raw-TCP tunnel range when enabled. |
 | `systemd/forwarder.service` | The server unit — loopback-pinned and hardened. |
 | `env.example` | Template for `/etc/forwarder/forwarder.env` (root, 0600). **No secrets in the repo.** |
 | `site.env` | **Repo-owned deployment config.** Non-secret keys pinned in git; sourced after the box's env file and wins for the keys it sets. Change it with a commit — CI redeploys. |
+| `server.env`, `hosts.json` | Non-secret daemon environment and exact-Host capacity/error policies. The unit reads `server.env` after the private environment file. |
+
+Application-only redeploys restart just `forwarder`. `redeploy.sh` compares the
+old and new commits; changes to infrastructure, dependencies or the toolchain
+still use the full installer. Host-policy updates apply on daemon restart. A
+server-only redeploy preserves all network-service configurations and does not
+restart Caddy, HAProxy or WireGuard. Agents reconnect after the brief restart.
 
 ## From zero
 

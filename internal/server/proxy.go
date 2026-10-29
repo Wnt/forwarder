@@ -134,35 +134,86 @@ func (s *Server) serveAgent(sess *yamux.Session, peer string) {
 func (s *Server) handlePublic(w http.ResponseWriter, r *http.Request) {
 	as, tunnelID := s.reg.lookupHost(r.Host)
 	if as == nil {
-		http.Error(w, "no tunnel registered for "+canonHost(r.Host), http.StatusBadGateway)
+		s.publicError(w, r, "no tunnel registered for "+canonHost(r.Host), http.StatusBadGateway)
 		return
 	}
-	release, ok := as.acquire()
+	host := s.hosts[canonHost(r.Host)]
+	var release func()
+	var ok bool
+	if host != nil {
+		release, ok = host.acquire()
+	} else {
+		release, ok = as.acquire()
+	}
 	if !ok {
-		http.Error(w, "tunnel at connection limit", http.StatusServiceUnavailable)
+		s.publicError(w, r, "tunnel at connection limit", http.StatusServiceUnavailable)
 		return
 	}
 	defer release()
 
-	st, err := as.sess.OpenStream()
+	ctx := r.Context()
+	var deadline time.Time
+	if host != nil && host.policy.HeaderTimeoutSeconds > 0 {
+		deadline = time.Now().Add(time.Duration(host.policy.HeaderTimeoutSeconds) * time.Second)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+		// Bound slow request uploads as well as reads from the agent. Clear this
+		// before streaming the response or handing over a WebSocket.
+		rc := http.NewResponseController(w)
+		_ = rc.SetReadDeadline(deadline)
+		defer rc.SetReadDeadline(time.Time{})
+	}
+	var st *yamux.Stream
+	var err error
+	if host != nil {
+		st, err = openStream(ctx, as.sess)
+	} else {
+		st, err = as.sess.OpenStream()
+	}
+	fail := func(message string, err error) {
+		code := gatewayStatus(err)
+		// net/http cancels the request after an upload read deadline; that can
+		// surface as a closed stream rather than a net.Error timeout.
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			code = http.StatusGatewayTimeout
+		}
+		s.publicError(w, r, message, code)
+	}
 	if err != nil {
-		http.Error(w, "agent unavailable", http.StatusBadGateway)
+		fail("agent unavailable", err)
 		return
 	}
 	defer st.Close()
+	st.SetDeadline(deadline)
+	stop := context.AfterFunc(r.Context(), func() {
+		st.SetDeadline(time.Now())
+		st.Close()
+	})
+	defer stop()
+	ready := func() {
+		st.SetDeadline(time.Time{})
+		if !deadline.IsZero() {
+			_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+		}
+	}
 
 	hdr := framing.ConnectHeader{TunnelID: tunnelID, RemoteAddr: realIP(r)}
 	if err := framing.WriteJSONLine(st, hdr); err != nil {
-		http.Error(w, "agent write error", http.StatusBadGateway)
+		fail("agent write error", err)
 		return
 	}
 	setForwardingHeaders(r)
 
 	if isWebSocketUpgrade(r) {
-		proxyWS(w, r, st)
+		if host == nil {
+			proxyWSRaw(w, r, st)
+		} else {
+			proxyWS(w, r, st, fail, ready)
+		}
 		return
 	}
-	proxyHTTP(w, r, st)
+	proxyHTTP(w, r, st, fail, ready)
 }
 
 // proxyHTTP forwards a single (non-upgrade) request/response over the stream.
@@ -178,26 +229,21 @@ func (s *Server) handlePublic(w http.ResponseWriter, r *http.Request) {
 // request), close the tunnel stream — the agent then closes its local
 // connection, which is how the app sees the disconnect — and unblock our own
 // read of the response.
-func proxyHTTP(w http.ResponseWriter, r *http.Request, st *yamux.Stream) {
-	stop := context.AfterFunc(r.Context(), func() {
-		st.Close()
-		st.SetDeadline(time.Now())
-	})
-	defer stop()
-
+func proxyHTTP(w http.ResponseWriter, r *http.Request, st *yamux.Stream, fail func(string, error), ready func()) {
 	// Re-serialize the request to the agent in origin form. r.Write preserves the
 	// original Host and writes the body, which is exactly what the runner behind
 	// the agent expects.
 	if err := r.Write(st); err != nil {
-		http.Error(w, "agent write error", http.StatusBadGateway)
+		fail("agent write error", err)
 		return
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(st), r)
 	if err != nil {
-		http.Error(w, "agent read error", http.StatusBadGateway)
+		fail("agent read error", err)
 		return
 	}
 	defer resp.Body.Close()
+	ready()
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	// Flush as we go so streaming responses (SSE, chunked) reach the client live.
@@ -208,7 +254,28 @@ func proxyHTTP(w http.ResponseWriter, r *http.Request, st *yamux.Stream) {
 // writing the upgrade request. From here the forwarder is a byte relay: it never
 // parses a WebSocket frame, so binary JPEG payloads pass through unbuffered and
 // without any payload-size cap.
-func proxyWS(w http.ResponseWriter, r *http.Request, st *yamux.Stream) {
+func proxyWS(w http.ResponseWriter, r *http.Request, st *yamux.Stream, fail func(string, error), ready func()) {
+	// Read the app's handshake before hijacking so a dead upstream or timed-out
+	// handshake still gets an HTTP error with this Host's CORS/retry policy.
+	if err := r.Write(st); err != nil {
+		fail("agent write error", err)
+		return
+	}
+	br := bufio.NewReader(st)
+	resp, err := http.ReadResponse(br, r)
+	if err != nil {
+		fail("agent read error", err)
+		return
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		defer resp.Body.Close()
+		ready()
+		copyHeader(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+	ready()
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "cannot hijack", http.StatusInternalServerError)
@@ -220,13 +287,32 @@ func proxyWS(w http.ResponseWriter, r *http.Request, st *yamux.Stream) {
 	}
 	defer client.Close()
 
-	// Send the upgrade request itself; the runner's 101 (and every frame after)
-	// flows back over the stream and out to the client untouched.
-	if err := r.Write(st); err != nil {
+	if err := resp.Write(bufrw); err != nil {
+		return
+	}
+	if err := bufrw.Flush(); err != nil {
 		return
 	}
 	// bufrw.Reader for the client->agent direction: Hijack may have buffered
 	// bytes past the request that a raw client.Read would miss.
+	pipeReaders(st, client, bufrw.Reader, br)
+}
+
+// Unconfigured guests retain their original raw upgrade relay.
+func proxyWSRaw(w http.ResponseWriter, r *http.Request, st *yamux.Stream) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "cannot hijack", http.StatusInternalServerError)
+		return
+	}
+	client, bufrw, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer client.Close()
+	if err := r.Write(st); err != nil {
+		return
+	}
 	pipe(st, client, bufrw.Reader)
 }
 
@@ -290,13 +376,17 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 // avoids yamux's half-closed StreamCloseTimeout force-killing a still-streaming
 // direction (the JPEG case, where the client sends almost nothing).
 func pipe(st *yamux.Stream, client net.Conn, clientR io.Reader) {
+	pipeReaders(st, client, clientR, st)
+}
+
+func pipeReaders(st *yamux.Stream, client net.Conn, clientR, upstreamR io.Reader) {
 	var once sync.Once
 	stop := func() { once.Do(func() { st.Close(); client.Close() }) }
 	go func() {
 		io.Copy(st, clientR) // client -> agent
 		stop()
 	}()
-	io.Copy(client, st) // agent -> client
+	io.Copy(client, upstreamR) // agent -> client, including buffered handshake bytes
 	stop()
 }
 

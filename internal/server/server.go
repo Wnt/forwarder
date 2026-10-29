@@ -16,10 +16,11 @@ import (
 
 // Config tunes a Server. Zero values get sane defaults via New.
 type Config struct {
-	ControlPath       string // reserved path the agent's control WS upgrades on
-	ControlHost       string // always cert-approved so the agent can dial in
-	AgentToken        string // shared bearer secret (required)
-	MaxConnsPerTunnel int    // per-agent concurrent public connection cap
+	ControlPath       string                // reserved path the agent's control WS upgrades on
+	ControlHost       string                // always cert-approved so the agent can dial in
+	AgentToken        string                // shared bearer secret (required)
+	MaxConnsPerTunnel int                   // per-agent concurrent public connection cap
+	HostPolicies      map[string]HostPolicy // optional exact-Host HTTP overrides
 
 	// Raw TCP passthrough (Phase 2). OFF unless TCPMaxPort > 0. TCP tunnels need a
 	// real public listen port (they can't ride Caddy's HTTP front door), so this
@@ -48,6 +49,7 @@ type Server struct {
 	reg     *registry
 	limiter *authLimiter
 	log     func(string, ...any)
+	hosts   map[string]*hostState
 }
 
 // New builds a Server. A nil logf discards logs.
@@ -65,7 +67,14 @@ func New(cfg Config, logf func(string, ...any)) *Server {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Server{cfg: cfg, reg: newRegistry(), limiter: newAuthLimiter(), log: logf}
+	hosts := make(map[string]*hostState)
+	for host, policy := range cfg.HostPolicies {
+		if policy.MaxConns <= 0 {
+			policy.MaxConns = cfg.MaxConnsPerTunnel
+		}
+		hosts[canonHost(host)] = &hostState{policy: policy, sem: make(chan struct{}, policy.MaxConns)}
+	}
+	return &Server{cfg: cfg, reg: newRegistry(), limiter: newAuthLimiter(), log: logf, hosts: hosts}
 }
 
 // Handler is the public+control ingress handler Caddy reverse-proxies to.
@@ -81,7 +90,15 @@ func (s *Server) ManagementHandler() http.Handler {
 	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(s.reg.snapshot())
+		view := s.reg.snapshot()
+		view.HostLimits = make(map[string]hostLimitView)
+		for host, h := range s.hosts {
+			view.HostLimits[host] = hostLimitView{
+				Active: len(h.sem), Limit: cap(h.sem), Peak: h.peak.Load(),
+				Rejected: h.reject.Load(), Errors: h.errors.Load(),
+			}
+		}
+		_ = json.NewEncoder(w).Encode(view)
 	})
 	return mux
 }

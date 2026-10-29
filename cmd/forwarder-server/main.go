@@ -15,6 +15,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -54,12 +55,23 @@ func main() {
 	if tcpMax > 0 {
 		log.Printf("tcp tunnels ENABLED on %s ports %d-%d", env("FORWARDER_TCP_BIND", "0.0.0.0"), tcpMin, tcpMax)
 	}
+	var policies map[string]server.HostPolicy
+	if path := os.Getenv("FORWARDER_HOST_POLICIES_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			log.Fatal("read host policies: ", err)
+		}
+		if err := json.Unmarshal(data, &policies); err != nil {
+			log.Fatal("parse host policies: ", err)
+		}
+	}
 
 	s := server.New(server.Config{
 		ControlPath:       env("FORWARDER_CONTROL_PATH", "/__forwarder/v1/control"),
 		ControlHost:       controlHost,
 		AgentToken:        os.Getenv("FORWARDER_AGENT_TOKEN"),
 		MaxConnsPerTunnel: envInt("FORWARDER_MAX_CONNS_PER_TUNNEL", 256),
+		HostPolicies:      policies,
 		TCPMinPort:        tcpMin,
 		TCPMaxPort:        tcpMax,
 		TCPBind:           env("FORWARDER_TCP_BIND", "0.0.0.0"),

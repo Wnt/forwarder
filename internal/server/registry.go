@@ -198,15 +198,41 @@ func (r *registry) snapshot() statusView {
 	for p := range r.byPort {
 		v.TCPPorts = append(v.TCPPorts, p)
 	}
+	for _, a := range r.agents {
+		streams := 0
+		if a.sess != nil {
+			streams = a.sess.NumStreams()
+		}
+		v.Sessions = append(v.Sessions, sessionView{
+			Hosts: a.hosts, Active: len(a.sem), Limit: cap(a.sem), Streams: streams,
+		})
+	}
 	sort.Strings(v.Hosts)
 	sort.Ints(v.TCPPorts)
 	return v
 }
 
 type statusView struct {
-	Agents   int      `json:"agents"`
-	Hosts    []string `json:"hosts"`
-	TCPPorts []int    `json:"tcp_ports"`
+	Agents     int                      `json:"agents"`
+	Hosts      []string                 `json:"hosts"`
+	TCPPorts   []int                    `json:"tcp_ports"`
+	Sessions   []sessionView            `json:"sessions"`
+	HostLimits map[string]hostLimitView `json:"host_limits"`
+}
+
+type sessionView struct {
+	Hosts   map[string]string `json:"hosts"`
+	Active  int               `json:"shared_active"`
+	Limit   int               `json:"shared_limit"`
+	Streams int               `json:"yamux_streams"` // includes the control stream
+}
+
+type hostLimitView struct {
+	Active   int   `json:"active"`
+	Limit    int   `json:"limit"`
+	Peak     int64 `json:"peak"`
+	Rejected int64 `json:"rejected"`
+	Errors   int64 `json:"forwarder_errors"`
 }
 
 // tcpLabel is the public host shown in a TCP tunnel's assigned RemoteAddr.
